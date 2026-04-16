@@ -3,7 +3,7 @@
 
 """
 ================================================================================
-ULTIMATE REVIEWER-PROOF PAPER SCRIPT (FIGURE 1–5 LAYOUT) — FINAL (NO MTM VERSION)
+ULTIMATE REVIEWER-PROOF PAPER SCRIPT (FIGURE 1–5 LAYOUT) — FINAL MERGED VERSION
 ================================================================================
 
 Algorithms:
@@ -24,12 +24,15 @@ Outputs:
   Captions: captions_draft.txt
   JSONL summary: results_all.jsonl
   NPZ full samples: results_samples_full.npz
+  Config: config_used.json
+  Log: run_log.txt
 
 Reviewer-proof design:
-  - Fair posterior evaluation budget (eval_budget per chain).
+  - Strict posterior evaluation budget (eval_budget per chain).
   - Adaptation frozen after burn-in.
   - ESS computed as concat ESS and min-chain ESS.
   - Split-Rhat computed from split chains.
+  - Stable headless plotting (Agg backend).
   - Clean Science/Nature style plotting.
 
 ================================================================================
@@ -42,6 +45,13 @@ import json
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+
+plt.switch_backend("Agg")
+plt.rcParams["backend"] = "Agg"
+
+import warnings
+warnings.filterwarnings("ignore")
+
 from tabulate import tabulate
 
 try:
@@ -62,13 +72,13 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.float64
 torch.set_default_dtype(DTYPE)
 
-OUTDIR = "paper_results_ULTIMATE_FINAL_NO_MTM"
+OUTDIR = "paper_results_ULTIMATE_FINAL_MERGED"
 os.makedirs(OUTDIR, exist_ok=True)
 
 LOGFILE = os.path.join(OUTDIR, "run_log.txt")
 
 
-def logprint(msg):
+def logprint(msg: str):
     print(msg)
     with open(LOGFILE, "a", encoding="utf-8") as f:
         f.write(msg + "\n")
@@ -82,63 +92,59 @@ logprint(f"Output folder: {OUTDIR}")
 
 
 # =============================================================================
-# ENHANCED PLOT STYLE (Science/Nature/PNAS Style) — Reviewer-Proof
+# Plot style (merged best of both)
 # =============================================================================
 plt.rcParams.update({
     "font.family": "sans-serif",
     "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
-    "font.size": 10,
-    "axes.titlesize": 11,
-    "axes.labelsize": 10,
-    "legend.fontsize": 9,
-    "xtick.labelsize": 9,
-    "ytick.labelsize": 9,
-    "axes.linewidth": 0.8,
-    "grid.alpha": 0.15,
+    "font.size": 9,
+    "axes.titlesize": 10,
+    "axes.labelsize": 9,
+    "legend.fontsize": 8,
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+    "axes.linewidth": 0.7,
+    "grid.linewidth": 0.5,
+    "grid.alpha": 0.18,
     "grid.linestyle": "--",
-    "figure.dpi": 220,
+    "lines.linewidth": 1.4,
+    "figure.dpi": 260,
     "savefig.dpi": 400,
     "savefig.transparent": False,
+    "figure.constrained_layout.use": True,
+    "savefig.bbox": "tight",
 })
 
-# Color-blind friendly high-contrast palette
 METHODS = ["Vanilla pCN", "Adap-ESS pCN", "Dual-signal pCN"]
 
+# Muted academic palette (high quality in print)
 METHOD_COLORS = {
-    "Vanilla pCN": "#2166ac",     # blue
-    "Adap-ESS pCN": "#b2182b",    # red
-    "Dual-signal pCN": "#1a9850", # green
+    "Vanilla pCN": "#4D4D4D",     # muted gray
+    "Adap-ESS pCN": "#B2182B",    # deep academic red
+    "Dual-signal pCN": "#1A9850", # deep green
 }
 
-MARKERS = {
-    "Vanilla pCN": "o",
-    "Adap-ESS pCN": "s",
-    "Dual-signal pCN": "^",
-}
+MARKERS = {"Vanilla pCN": "o", "Adap-ESS pCN": "s", "Dual-signal pCN": "^"}
+LINESTYLES = {"Vanilla pCN": "-", "Adap-ESS pCN": "--", "Dual-signal pCN": "-."}
 
-LINESTYLES = {
-    "Vanilla pCN": "-",
-    "Adap-ESS pCN": "--",
-    "Dual-signal pCN": "-.",
-}
+
+def beautify_ax(ax, grid=True):
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.tick_params(direction="out", length=3, width=0.6)
+    if grid:
+        ax.grid(True)
 
 
 def add_panel_label(ax, label):
     ax.text(
-        -0.12, 1.08, f"({label})",
+        -0.14, 1.10, f"({label})",
         transform=ax.transAxes,
-        fontsize=13,
+        fontsize=11,
         fontweight="bold",
         va="top",
-        ha="left"
+        ha="right"
     )
-
-
-def clean_axes(ax, grid=True):
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    if grid:
-        ax.grid(True, alpha=0.18, linewidth=0.6)
 
 
 # =============================================================================
@@ -159,7 +165,7 @@ EVAL = EvalCounter()
 
 
 # =============================================================================
-# Log-likelihood and log-prior
+# Log posterior
 # =============================================================================
 def log_likelihood(x, AtA, Aty, sigma):
     quad_like = torch.dot(x, AtA @ x) - 2.0 * torch.dot(x, Aty)
@@ -181,13 +187,15 @@ def log_posterior(x, invL, AtA, Aty, sigma):
 def ess_1d(series):
     series = np.asarray(series, dtype=np.float64)
     n = len(series)
+
     if n < 30:
         return float(max(1, n))
+
     if np.allclose(series, series[0], atol=1e-12):
         return 1.0
 
     series = series - series.mean()
-    ac = np.correlate(series, series, mode="full")[n-1:]
+    ac = np.correlate(series, series, mode="full")[n - 1:]
     ac = ac / (ac[0] + 1e-30)
 
     cutoff = min(n, 4000)
@@ -198,6 +206,7 @@ def ess_1d(series):
 
     tau = 1.0 + 2.0 * np.sum(ac[1:cutoff])
     ess = n / max(tau, 1e-12)
+
     return float(max(1.0, min(n, ess)))
 
 
@@ -219,6 +228,7 @@ def ess_min(samples):
 def split_rhat(chains):
     chains = np.asarray(chains, dtype=np.float64)
     m, n, d = chains.shape
+
     if n < 50:
         return np.ones(d)
 
@@ -241,6 +251,22 @@ def split_rhat(chains):
 # =============================================================================
 def smooth_w(t, t0, s=0.2):
     return 1.0 / (1.0 + math.exp(-(t - t0) / (s * t0 + 1e-12)))
+
+
+# =============================================================================
+# Autocorrelation
+# =============================================================================
+def autocorr(x, max_lag=200):
+    x = np.asarray(x, dtype=np.float64)
+    x = x - x.mean()
+    n = len(x)
+
+    if n < 5:
+        return np.zeros(max_lag)
+
+    ac = np.correlate(x, x, mode="full")[n-1:]
+    ac = ac / (ac[0] + 1e-30)
+    return ac[:max_lag]
 
 
 # =============================================================================
@@ -286,6 +312,7 @@ def pcn_adap_ess(x0, invL, sqrtL, AtA, Aty, sigma, beta0, N, dim, adapt_stop):
 
     logb = math.log(beta0)
     scale = 1.0 / math.sqrt(dim)
+
     logb_min = math.log(0.004 * scale)
     logb_max = math.log(0.90 * scale)
 
@@ -313,9 +340,11 @@ def pcn_adap_ess(x0, invL, sqrtL, AtA, Aty, sigma, beta0, N, dim, adapt_stop):
 
         samples[i] = x.detach().cpu().numpy()
 
+        # FIXED: ar must be acc/(i+1)
         if i < adapt_stop and i > 0 and i % 200 == 0:
-            ar = acc / i
-            logb += 0.12 / math.sqrt(i / 200) * (ar - 0.234)
+            ar = acc / (i + 1)
+            gamma = 0.12 / math.sqrt(i / 200.0 + 1.0)
+            logb += gamma * (ar - 0.234)
             logb = float(np.clip(logb, logb_min, logb_max))
 
     return samples, acc / N, time.time() - t0
@@ -330,6 +359,7 @@ def pcn_dual(x0, invL, sqrtL, AtA, Aty, sigma, beta0, N, t_switch, dim, adapt_st
 
     logb = math.log(beta0)
     scale = 1.0 / math.sqrt(dim)
+
     logb_min = math.log(0.004 * scale)
     logb_max = math.log(0.90 * scale)
 
@@ -358,17 +388,19 @@ def pcn_dual(x0, invL, sqrtL, AtA, Aty, sigma, beta0, N, t_switch, dim, adapt_st
         samples[i] = x.detach().cpu().numpy()
 
         if i < adapt_stop and i > 0 and i % 200 == 0:
-            ar = acc / i
+            ar = acc / (i + 1)
             w = smooth_w(i, t_switch)
 
             g_acc = ar - 0.234
             g_ess = 0.0
 
+            # ESS feedback only after enough samples
             if i > 2500:
                 blk = samples[i-2000:i]
                 g_ess = np.clip((ess_mean(blk) / 2000.0) - 0.5, -1.0, 1.0)
 
-            logb += 0.10 / math.sqrt(i / 200) * ((1 - w) * g_acc + w * g_ess)
+            gamma = 0.10 / math.sqrt(i / 200.0 + 1.0)
+            logb += gamma * ((1.0 - w) * g_acc + w * g_ess)
             logb = float(np.clip(logb, logb_min, logb_max))
 
     return samples, acc / N, time.time() - t0
@@ -471,58 +503,48 @@ def summarize_multichain(chains, burn, x_true_np, Sigma_true):
 
 
 # =============================================================================
-# Autocorrelation
-# =============================================================================
-def autocorr(x, max_lag=200):
-    x = np.asarray(x, dtype=np.float64)
-    x = x - x.mean()
-    n = len(x)
-    ac = np.correlate(x, x, mode="full")[n-1:]
-    ac = ac / (ac[0] + 1e-30)
-    return ac[:max_lag]
-
-
-# =============================================================================
 # FIGURE 1
 # =============================================================================
 def plot_fig1(entry, outfile_png, outfile_pdf):
-    svals = np.asarray(entry["singular_vals"], dtype=np.float64)
-    prior_std = np.asarray(entry["prior_std"], dtype=np.float64)
-    dim = int(entry["dim"])
-
-    fig, axes = plt.subplots(1, 3, figsize=(12.2, 3.6))
-    labels = ["a", "b", "c"]
+    svals = entry["singular_vals"]
+    prior_std = entry["prior_std"]
+    dim = entry["dim"]
 
     x = np.arange(1, dim + 1)
 
-    axes[0].plot(x, svals, color="#333333", lw=1.6)
-    axes[0].fill_between(x, svals, color="#333333", alpha=0.10)
-    axes[0].set_title("Forward spectrum", pad=8)
+    fig, axes = plt.subplots(1, 3, figsize=(10.2, 3.1))
+
+    axes[0].fill_between(x, svals, color="#BDC3C7", alpha=0.20)
+    axes[0].plot(x, svals, color="#2C3E50", lw=1.6)
+    axes[0].set_title("Forward Spectrum", fontweight="bold")
     axes[0].set_xlabel("Index $i$")
-    axes[0].set_ylabel("Singular value $\\sigma_i$")
+    axes[0].set_ylabel("Singular Value $\\sigma_i$")
 
     axes[1].plot(
         x, prior_std,
-        color="#2c7fb8", lw=1.6,
-        marker="o", markersize=2.5, markevery=max(1, dim // 20)
+        color="#2980B9",
+        marker="o",
+        markersize=2.5,
+        mec="white",
+        mew=0.5,
+        lw=1.4,
+        markevery=max(1, dim // 20)
     )
-    axes[1].set_title("Prior scale", pad=8)
+    axes[1].set_title("Prior Length Scales", fontweight="bold")
     axes[1].set_xlabel("Index $i$")
     axes[1].set_ylabel("$\\sqrt{L_{ii}}$")
 
-    proxy = 1.0 / (1.0 + svals**2)
-    axes[2].bar(x, proxy, color="#f03b20", alpha=0.55, width=0.9)
-    axes[2].set_title("Contraction proxy", pad=8)
+    axes[2].bar(x, 1.0 / (1.0 + svals**2), color="#E74C3C", alpha=0.65, width=0.85)
+    axes[2].set_title("Inference Difficulty", fontweight="bold")
     axes[2].set_xlabel("Index $i$")
-    axes[2].set_ylabel("$(1+\\sigma_i^2)^{-1}$")
+    axes[2].set_ylabel("Contraction Proxy")
 
     for i, ax in enumerate(axes):
-        add_panel_label(ax, labels[i])
-        clean_axes(ax)
+        beautify_ax(ax)
+        add_panel_label(ax, ["a", "b", "c"][i])
 
-    plt.tight_layout()
-    plt.savefig(outfile_png, bbox_inches="tight")
-    plt.savefig(outfile_pdf, bbox_inches="tight")
+    plt.savefig(outfile_png)
+    plt.savefig(outfile_pdf)
     plt.close(fig)
 
 
@@ -532,53 +554,48 @@ def plot_fig1(entry, outfile_png, outfile_pdf):
 def plot_fig2_baseline(res0, outfile_png, outfile_pdf):
     dims = sorted(list(set([r["dim"] for r in res0])))
 
-    fig, axes = plt.subplots(2, 2, figsize=(11.3, 8.2))
+    fig, axes = plt.subplots(2, 2, figsize=(9.2, 7.0))
     axes = axes.flatten()
-    labels = ["a", "b", "c", "d"]
 
     metrics = ["ESS_s", "ESS_eval", "Rhat", "AR"]
-    titles = [
-        "Absolute efficiency (ESS/s)",
-        "Algorithmic efficiency (ESS/eval)",
-        "Convergence diagnostic (Split-$\\hat{R}$)",
-        "Acceptance rate",
-    ]
-    ylabels = ["ESS/s", "ESS/eval", "Split-$\\hat{R}$", "AR"]
+    ylabels = ["ESS / sec", "ESS / eval", "Split-$\\hat{R}$", "Acceptance Rate"]
+    titles = ["Absolute Efficiency", "Algorithmic Efficiency", "Convergence Rate", "Acceptance Behavior"]
 
-    for i, metric in enumerate(metrics):
+    for i, m in enumerate(metrics):
         ax = axes[i]
 
         for method in METHODS:
             rr = sorted([r for r in res0 if r["method"] == method], key=lambda x: x["dim"])
             ax.plot(
                 [x["dim"] for x in rr],
-                [x[metric] for x in rr],
+                [x[m] for x in rr],
                 marker=MARKERS[method],
-                markersize=5,
-                lw=1.8,
+                markersize=6,
+                mec="white",
+                mew=0.8,
                 linestyle=LINESTYLES[method],
                 color=METHOD_COLORS[method],
                 label=method
             )
 
-        ax.set_title(titles[i], pad=8)
+        ax.set_title(titles[i], fontweight="bold")
         ax.set_xlabel("Dimension $d$")
         ax.set_ylabel(ylabels[i])
-        add_panel_label(ax, labels[i])
-        clean_axes(ax)
 
-        if metric == "Rhat":
-            ax.axhline(1.1, color="#666666", linestyle=":", lw=1.2, alpha=0.8)
-        if metric == "AR":
-            ax.axhline(0.234, color="#666666", linestyle="--", lw=1.2, alpha=0.7)
+        beautify_ax(ax)
+        add_panel_label(ax, ["a", "b", "c", "d"][i])
+
+        if m == "Rhat":
+            ax.axhline(1.1, color="black", ls=":", alpha=0.35)
+        if m == "AR":
+            ax.axhline(0.234, color="black", ls="--", alpha=0.20)
 
         ax.set_xticks(dims)
 
-    axes[0].legend(frameon=False, loc="upper right", ncol=1)
+    axes[0].legend(frameon=False, loc="upper right")
 
-    plt.tight_layout()
-    plt.savefig(outfile_png, bbox_inches="tight")
-    plt.savefig(outfile_pdf, bbox_inches="tight")
+    plt.savefig(outfile_png)
+    plt.savefig(outfile_pdf)
     plt.close(fig)
 
 
@@ -588,62 +605,58 @@ def plot_fig2_baseline(res0, outfile_png, outfile_pdf):
 def plot_fig3_regime(all_results, outfile_png, outfile_pdf, fixed_dim=80):
     regimes = ["WellConditioned", "IllConditioned", "LowSNR", "HighSNR"]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.2, 4.6))
-
-    width = 0.24
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10.2, 4.1))
+    width = 0.22
     xbase = np.arange(len(regimes))
 
     for mi, method in enumerate(METHODS):
-        vals_s = []
-        vals_ev = []
-        for reg in regimes:
-            rr = [r for r in all_results if r["exp"] == reg and r["dim"] == fixed_dim and r["method"] == method]
-            vals_s.append(rr[0]["ESS_s"])
-            vals_ev.append(rr[0]["ESS_eval"])
+        vals_s = [next(r["ESS_s"] for r in all_results if r["exp"] == reg and r["method"] == method and r["dim"] == fixed_dim) for reg in regimes]
+        vals_ev = [next(r["ESS_eval"] for r in all_results if r["exp"] == reg and r["method"] == method and r["dim"] == fixed_dim) for reg in regimes]
 
         ax1.bar(
-            xbase + (mi - 1.0) * width,
+            xbase + (mi - 1) * width,
             vals_s,
             width=width,
-            label=method,
             color=METHOD_COLORS[method],
+            alpha=0.85,
             edgecolor="white",
-            linewidth=0.6,
-            alpha=0.90
+            linewidth=0.5,
+            label=method
         )
 
         ax2.bar(
-            xbase + (mi - 1.0) * width,
+            xbase + (mi - 1) * width,
             vals_ev,
             width=width,
-            label=method,
             color=METHOD_COLORS[method],
+            alpha=0.85,
             edgecolor="white",
-            linewidth=0.6,
-            alpha=0.90
+            linewidth=0.5,
+            label=method
         )
 
-    ax1.set_title(f"Efficiency by regime ($d={fixed_dim}$)", pad=8)
-    ax1.set_ylabel("ESS/s")
-    ax1.set_xticks(xbase)
-    ax1.set_xticklabels(regimes, rotation=12)
+    ax1.set_title("Sampling Speed", fontweight="bold")
+    ax2.set_title("Evaluation Economy", fontweight="bold")
 
-    ax2.set_title(f"Evaluation economy ($d={fixed_dim}$)", pad=8)
-    ax2.set_ylabel("ESS/eval")
+    ax1.set_ylabel("ESS / sec")
+    ax2.set_ylabel("ESS / eval")
+
+    ax1.set_xticks(xbase)
     ax2.set_xticks(xbase)
-    ax2.set_xticklabels(regimes, rotation=12)
+
+    ax1.set_xticklabels(regimes, rotation=15)
+    ax2.set_xticklabels(regimes, rotation=15)
+
+    beautify_ax(ax1)
+    beautify_ax(ax2)
 
     add_panel_label(ax1, "a")
     add_panel_label(ax2, "b")
 
-    clean_axes(ax1, grid=True)
-    clean_axes(ax2, grid=True)
-
     ax2.legend(frameon=False, bbox_to_anchor=(1.02, 1.0), loc="upper left")
 
-    plt.tight_layout()
-    plt.savefig(outfile_png, bbox_inches="tight")
-    plt.savefig(outfile_pdf, bbox_inches="tight")
+    plt.savefig(outfile_png)
+    plt.savefig(outfile_pdf)
     plt.close(fig)
 
 
@@ -651,55 +664,44 @@ def plot_fig3_regime(all_results, outfile_png, outfile_pdf, fixed_dim=80):
 # FIGURE 4
 # =============================================================================
 def plot_fig4_trace_acf(res_ill, outfile_png, outfile_pdf):
-    fixed_dim = res_ill[0]["dim"]
-
-    fig, axes = plt.subplots(2, 2, figsize=(11.3, 7.6))
+    fig, axes = plt.subplots(2, 2, figsize=(9.2, 6.4))
     axes = axes.flatten()
 
-    max_trace_len = 3000
-    max_acf_lag = 200
+    max_trace_len = 2500
+    max_acf_lag = 150
 
     for method in METHODS:
-        entry = [r for r in res_ill if r["method"] == method][0]
+        entry = next(r for r in res_ill if r["method"] == method)
         chain = entry["chains"][0]
+        burn = entry["burn"]
+
         color = METHOD_COLORS[method]
 
-        axes[0].plot(chain[:max_trace_len, 0], color=color, alpha=0.70, lw=0.7, label=method)
-        axes[2].plot(chain[:max_trace_len, 1], color=color, alpha=0.70, lw=0.7)
+        trace0 = chain[:max_trace_len, 0]
+        trace1 = chain[:max_trace_len, 1]
 
-        ac0 = autocorr(chain[:8000, 0], max_lag=max_acf_lag)
-        ac1 = autocorr(chain[:8000, 1], max_lag=max_acf_lag)
+        ac0 = autocorr(chain[burn:, 0], max_lag=max_acf_lag)
+        ac1 = autocorr(chain[burn:, 1], max_lag=max_acf_lag)
 
-        axes[1].plot(ac0, color=color, lw=1.6)
-        axes[3].plot(ac1, color=color, lw=1.6)
+        axes[0].plot(trace0, color=color, alpha=0.65, lw=0.6, label=method)
+        axes[2].plot(trace1, color=color, alpha=0.65, lw=0.6)
 
-    axes[0].set_title(f"Trace plot $x_1$ (ill-conditioned, $d={fixed_dim}$)", loc="left", pad=6)
-    axes[1].set_title(f"ACF $x_1$ (ill-conditioned, $d={fixed_dim}$)", loc="left", pad=6)
-    axes[2].set_title(f"Trace plot $x_2$ (ill-conditioned, $d={fixed_dim}$)", loc="left", pad=6)
-    axes[3].set_title(f"ACF $x_2$ (ill-conditioned, $d={fixed_dim}$)", loc="left", pad=6)
+        axes[1].plot(ac0, color=color, lw=1.4)
+        axes[3].plot(ac1, color=color, lw=1.4)
 
-    axes[0].set_xlabel("Iteration")
-    axes[0].set_ylabel("$x_1$")
-    axes[2].set_xlabel("Iteration")
-    axes[2].set_ylabel("$x_2$")
-
-    axes[1].set_xlabel("Lag")
-    axes[1].set_ylabel("ACF")
-    axes[3].set_xlabel("Lag")
-    axes[3].set_ylabel("ACF")
-
+    titles = ["Trace plot $x_1$", "ACF $x_1$", "Trace plot $x_2$", "ACF $x_2$"]
     for i, ax in enumerate(axes):
+        ax.set_title(titles[i], fontweight="bold", loc="left")
+        beautify_ax(ax)
         add_panel_label(ax, ["a", "b", "c", "d"][i])
-        clean_axes(ax)
 
         if i in [1, 3]:
-            ax.axhline(0.0, color="#555555", lw=1.0, alpha=0.4)
+            ax.axhline(0.0, color="black", lw=1.0, alpha=0.25)
 
     axes[0].legend(frameon=False, ncol=3, loc="upper right")
 
-    plt.tight_layout()
-    plt.savefig(outfile_png, bbox_inches="tight")
-    plt.savefig(outfile_pdf, bbox_inches="tight")
+    plt.savefig(outfile_png)
+    plt.savefig(outfile_pdf)
     plt.close(fig)
 
 
@@ -707,52 +709,50 @@ def plot_fig4_trace_acf(res_ill, outfile_png, outfile_pdf):
 # FIGURE 5
 # =============================================================================
 def plot_fig5_marginals(entry, outfile_png, outfile_pdf, burn):
-    chains = entry["chains"]
-    method = entry["method"]
-    exp = entry["exp"]
-    dim = entry["dim"]
+    import scipy.stats as st
 
-    post = np.concatenate([c[burn:] for c in chains], axis=0)
+    post = np.concatenate([c[burn:] for c in entry["chains"]], axis=0)
+
     x0 = post[:, 0]
     x1 = post[:, 1]
+    color = METHOD_COLORS[entry["method"]]
+
+    fig = plt.figure(figsize=(7.2, 6.2))
+    gs = fig.add_gridspec(2, 2, width_ratios=(4, 1.2), height_ratios=(1.2, 4), wspace=0.05, hspace=0.05)
+
+    ax_main = fig.add_subplot(gs[1, 0])
+    ax_hx = fig.add_subplot(gs[0, 0], sharex=ax_main)
+    ax_hy = fig.add_subplot(gs[1, 1], sharey=ax_main)
+
+    ax_main.hexbin(x0, x1, gridsize=40, cmap="Greys", mincnt=1, alpha=0.20)
 
     rng = np.random.default_rng(12345)
-    n_scatter = min(len(x0), 6000)
-    idx = rng.choice(len(x0), size=n_scatter, replace=False)
+    idx = rng.choice(len(x0), size=min(len(x0), 3500), replace=False)
+    ax_main.scatter(x0[idx], x1[idx], s=1.2, color=color, alpha=0.25)
 
-    color = METHOD_COLORS[method]
+    kde_x = st.gaussian_kde(x0)
+    kde_y = st.gaussian_kde(x1)
 
-    fig = plt.figure(figsize=(8.4, 7.2))
-    gs = fig.add_gridspec(
-        2, 2,
-        width_ratios=[4, 1.2],
-        height_ratios=[1.2, 4],
-        wspace=0.05,
-        hspace=0.05
-    )
+    xx = np.linspace(x0.min(), x0.max(), 200)
+    yy = np.linspace(x1.min(), x1.max(), 200)
 
-    ax_histx = fig.add_subplot(gs[0, 0])
-    ax_main = fig.add_subplot(gs[1, 0])
-    ax_histy = fig.add_subplot(gs[1, 1])
+    ax_hx.fill_between(xx, kde_x(xx), color=color, alpha=0.30)
+    ax_hx.plot(xx, kde_x(xx), color=color, lw=1.2)
 
-    ax_main.hist2d(x0, x1, bins=80, density=True, cmap="Greys", alpha=0.50)
-    ax_main.scatter(x0[idx], x1[idx], s=2.5, alpha=0.18, color=color)
+    ax_hy.fill_betweenx(yy, kde_y(yy), color=color, alpha=0.30)
+    ax_hy.plot(kde_y(yy), yy, color=color, lw=1.2)
 
-    ax_histx.hist(x0, bins=90, density=True, alpha=0.45, color=color)
-    ax_histy.hist(x1, bins=90, density=True, alpha=0.45, color=color, orientation="horizontal")
+    ax_hx.axis("off")
+    ax_hy.axis("off")
 
-    ax_histx.axis("off")
-    ax_histy.axis("off")
+    ax_main.set_xlabel("Parameter $x_1$")
+    ax_main.set_ylabel("Parameter $x_2$")
 
-    ax_main.set_xlabel("$x_1$")
-    ax_main.set_ylabel("$x_2$")
-    ax_main.set_title(f"Posterior geometry | {method} | {exp} | $d={dim}$", pad=10)
+    beautify_ax(ax_main)
+    ax_main.set_title(f"Posterior Concentration: {entry['method']}", fontweight="bold", pad=8)
 
-    clean_axes(ax_main, grid=True)
-
-    plt.tight_layout()
-    plt.savefig(outfile_png, bbox_inches="tight")
-    plt.savefig(outfile_pdf, bbox_inches="tight")
+    plt.savefig(outfile_png)
+    plt.savefig(outfile_pdf)
     plt.close(fig)
 
 
@@ -786,7 +786,7 @@ def write_caption_drafts(outfile):
     txt.append("Trace plots and autocorrelation functions for the first two coordinates, highlighting mixing behavior.")
 
     txt.append("\nFigure 5 | Posterior geometry visualization (best sampler in ill-conditioned regime).")
-    txt.append("Joint posterior density plot and marginal histograms for the first two coordinates after burn-in.")
+    txt.append("Joint posterior density plot and marginal KDEs for the first two coordinates after burn-in.")
 
     with open(outfile, "w", encoding="utf-8") as f:
         f.write("\n".join(txt))
@@ -839,7 +839,6 @@ def make_table(results_subset, title, outfile):
 # Experiment runner
 # =============================================================================
 def run_experiment(exp_name, dim_list, n_chains=4, eval_budget=20000):
-
     logprint("\n" + "=" * 92)
     logprint(f"Experiment: {exp_name}")
     logprint("=" * 92)
@@ -881,9 +880,6 @@ def run_experiment(exp_name, dim_list, n_chains=4, eval_budget=20000):
 
         for method in METHODS:
 
-            # -------------------------------------------------------------
-            # Fairness: same posterior evaluation budget (strict)
-            # -------------------------------------------------------------
             N = eval_budget - 1
 
             burn_frac = 0.30
@@ -913,8 +909,10 @@ def run_experiment(exp_name, dim_list, n_chains=4, eval_budget=20000):
                     s, ar, t = pcn_adap_ess(x_init, invL, sqrtL, AtA, Aty, sigma, init_beta, N, dim, adapt_stop)
 
                 else:
-                    s, ar, t = pcn_dual(x_init, invL, sqrtL, AtA, Aty, sigma, init_beta, N,
-                                        int(0.5 * adapt_stop), dim, adapt_stop)
+                    s, ar, t = pcn_dual(
+                        x_init, invL, sqrtL, AtA, Aty, sigma,
+                        init_beta, N, int(0.5 * adapt_stop), dim, adapt_stop
+                    )
 
                 chains.append(s)
                 times.append(t)
@@ -959,118 +957,131 @@ def run_experiment(exp_name, dim_list, n_chains=4, eval_budget=20000):
 
 
 # =============================================================================
-# MAIN EXECUTION (Jupyter-friendly)
+# MAIN
 # =============================================================================
-t_global0 = time.time()
+if __name__ == "__main__":
 
-baseline_dims = list(range(10, 101, 10))
-fixed_dim = 80
-eval_budget = 20000
-n_chains = 4
+    t_global0 = time.time()
 
-# -------------------------------------------------------------------------
-# Run experiments
-# -------------------------------------------------------------------------
-res0 = run_experiment("BaselineScan", baseline_dims, n_chains=n_chains, eval_budget=eval_budget)
-res1 = run_experiment("WellConditioned", [fixed_dim], n_chains=n_chains, eval_budget=eval_budget)
-res2 = run_experiment("IllConditioned", [fixed_dim], n_chains=n_chains, eval_budget=eval_budget)
-res3 = run_experiment("LowSNR", [fixed_dim], n_chains=n_chains, eval_budget=eval_budget)
-res4 = run_experiment("HighSNR", [fixed_dim], n_chains=n_chains, eval_budget=eval_budget)
+    baseline_dims = list(range(10, 101, 10))
+    fixed_dim = 80
+    eval_budget = 20000
+    n_chains = 4
 
-all_results = res0 + res1 + res2 + res3 + res4
+    # -------------------------------------------------------------------------
+    # Run experiments
+    # -------------------------------------------------------------------------
+    res0 = run_experiment("BaselineScan", baseline_dims, n_chains=n_chains, eval_budget=eval_budget)
+    res1 = run_experiment("WellConditioned", [fixed_dim], n_chains=n_chains, eval_budget=eval_budget)
+    res2 = run_experiment("IllConditioned", [fixed_dim], n_chains=n_chains, eval_budget=eval_budget)
+    res3 = run_experiment("LowSNR", [fixed_dim], n_chains=n_chains, eval_budget=eval_budget)
+    res4 = run_experiment("HighSNR", [fixed_dim], n_chains=n_chains, eval_budget=eval_budget)
 
-# -------------------------------------------------------------------------
-# Save JSONL summary (no huge arrays)
-# -------------------------------------------------------------------------
-jsonl_path = os.path.join(OUTDIR, "results_all.jsonl")
-with open(jsonl_path, "w", encoding="utf-8") as f:
-    f.write("")
+    all_results = res0 + res1 + res2 + res3 + res4
 
-for r in all_results:
-    r_small = {k: v for k, v in r.items() if k not in ["chains", "singular_vals", "prior_std"]}
-    append_jsonl(jsonl_path, r_small)
+    # -------------------------------------------------------------------------
+    # Save JSONL summary
+    # -------------------------------------------------------------------------
+    jsonl_path = os.path.join(OUTDIR, "results_all.jsonl")
+    with open(jsonl_path, "w", encoding="utf-8") as f:
+        f.write("")
 
-logprint(f"\n✓ Saved JSONL: {OUTDIR}/results_all.jsonl")
+    for r in all_results:
+        r_small = {k: v for k, v in r.items() if k not in ["chains", "singular_vals", "prior_std"]}
+        append_jsonl(jsonl_path, r_small)
 
-# -------------------------------------------------------------------------
-# Save full samples NPZ (for reproducibility)
-# -------------------------------------------------------------------------
-npz_dict = {}
-for i, r in enumerate(all_results):
-    key = f"{r['exp']}_d{r['dim']}_{r['method'].replace(' ', '_').replace('+','PLUS')}"
-    npz_dict[key] = np.stack(r["chains"], axis=0)
+    logprint(f"\n✓ Saved JSONL: {OUTDIR}/results_all.jsonl")
 
-np.savez_compressed(os.path.join(OUTDIR, "results_samples_full.npz"), **npz_dict)
-logprint(f"✓ Saved NPZ full samples: {OUTDIR}/results_samples_full.npz")
+    # -------------------------------------------------------------------------
+    # Save full samples NPZ
+    # -------------------------------------------------------------------------
+    npz_dict = {}
+    for r in all_results:
+        key = f"{r['exp']}_d{r['dim']}_{r['method'].replace(' ', '_').replace('+','PLUS')}"
+        npz_dict[key] = np.stack(r["chains"], axis=0)
 
-# -------------------------------------------------------------------------
-# Save config
-# -------------------------------------------------------------------------
-config = {
-    "seed": SEED,
-    "dtype": str(DTYPE),
-    "device": str(DEVICE),
-    "baseline_dims": baseline_dims,
-    "fixed_dim": fixed_dim,
-    "methods": METHODS,
-    "eval_budget": eval_budget,
-    "n_chains": n_chains
-}
+    np.savez_compressed(os.path.join(OUTDIR, "results_samples_full.npz"), **npz_dict)
+    logprint(f"✓ Saved NPZ full samples: {OUTDIR}/results_samples_full.npz")
 
-with open(os.path.join(OUTDIR, "config_used.json"), "w", encoding="utf-8") as f:
-    json.dump(config, f, indent=2)
+    # -------------------------------------------------------------------------
+    # Save config
+    # -------------------------------------------------------------------------
+    config = {
+        "seed": SEED,
+        "dtype": str(DTYPE),
+        "device": str(DEVICE),
+        "baseline_dims": baseline_dims,
+        "fixed_dim": fixed_dim,
+        "methods": METHODS,
+        "eval_budget": eval_budget,
+        "n_chains": n_chains,
+    }
 
-logprint(f"✓ Saved config: {OUTDIR}/config_used.json")
+    with open(os.path.join(OUTDIR, "config_used.json"), "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
 
-# -------------------------------------------------------------------------
-# Tables
-# -------------------------------------------------------------------------
-make_table(all_results, "MAIN TABLE (ALL EXPERIMENTS)", os.path.join(OUTDIR, "Table_Main.txt"))
-make_table(res0, "TABLE S1 (BaselineScan)", os.path.join(OUTDIR, "Table_S1_BaselineScan.txt"))
-make_table(res1, "TABLE S2 (WellConditioned)", os.path.join(OUTDIR, "Table_S2_WellConditioned.txt"))
-make_table(res2, "TABLE S3 (IllConditioned)", os.path.join(OUTDIR, "Table_S3_IllConditioned.txt"))
-make_table(res3, "TABLE S4 (LowSNR)", os.path.join(OUTDIR, "Table_S4_LowSNR.txt"))
-make_table(res4, "TABLE S5 (HighSNR)", os.path.join(OUTDIR, "Table_S5_HighSNR.txt"))
+    logprint(f"✓ Saved config: {OUTDIR}/config_used.json")
 
-# -------------------------------------------------------------------------
-# Figures
-# -------------------------------------------------------------------------
-fig1_entry = [r for r in res0 if r["dim"] == fixed_dim and r["method"] == "Vanilla pCN"][0]
-plot_fig1(fig1_entry,
-          os.path.join(OUTDIR, "Fig1_problem_setup.png"),
-          os.path.join(OUTDIR, "Fig1_problem_setup.pdf"))
+    # -------------------------------------------------------------------------
+    # Tables
+    # -------------------------------------------------------------------------
+    make_table(all_results, "MAIN TABLE (ALL EXPERIMENTS)", os.path.join(OUTDIR, "Table_Main.txt"))
+    make_table(res0, "TABLE S1 (BaselineScan)", os.path.join(OUTDIR, "Table_S1_BaselineScan.txt"))
+    make_table(res1, "TABLE S2 (WellConditioned)", os.path.join(OUTDIR, "Table_S2_WellConditioned.txt"))
+    make_table(res2, "TABLE S3 (IllConditioned)", os.path.join(OUTDIR, "Table_S3_IllConditioned.txt"))
+    make_table(res3, "TABLE S4 (LowSNR)", os.path.join(OUTDIR, "Table_S4_LowSNR.txt"))
+    make_table(res4, "TABLE S5 (HighSNR)", os.path.join(OUTDIR, "Table_S5_HighSNR.txt"))
 
-plot_fig2_baseline(res0,
-                   os.path.join(OUTDIR, "Fig2_baseline_scaling.png"),
-                   os.path.join(OUTDIR, "Fig2_baseline_scaling.pdf"))
+    # -------------------------------------------------------------------------
+    # Figures
+    # -------------------------------------------------------------------------
+    fig1_entry = [r for r in res0 if r["dim"] == fixed_dim and r["method"] == "Vanilla pCN"][0]
 
-plot_fig3_regime(all_results,
-                 os.path.join(OUTDIR, "Fig3_regime_barplot.png"),
-                 os.path.join(OUTDIR, "Fig3_regime_barplot.pdf"),
-                 fixed_dim=fixed_dim)
+    plot_fig1(
+        fig1_entry,
+        os.path.join(OUTDIR, "Fig1_problem_setup.png"),
+        os.path.join(OUTDIR, "Fig1_problem_setup.pdf")
+    )
 
-plot_fig4_trace_acf(res2,
-                    os.path.join(OUTDIR, "Fig4_trace_acf_illconditioned.png"),
-                    os.path.join(OUTDIR, "Fig4_trace_acf_illconditioned.pdf"))
+    plot_fig2_baseline(
+        res0,
+        os.path.join(OUTDIR, "Fig2_baseline_scaling.png"),
+        os.path.join(OUTDIR, "Fig2_baseline_scaling.pdf")
+    )
 
-best_ill = max(res2, key=lambda x: x["ESS_eval"])
-plot_fig5_marginals(best_ill,
-                    os.path.join(OUTDIR, "Fig5_posterior_marginals.png"),
-                    os.path.join(OUTDIR, "Fig5_posterior_marginals.pdf"),
-                    burn=best_ill["burn"])
+    plot_fig3_regime(
+        all_results,
+        os.path.join(OUTDIR, "Fig3_regime_barplot.png"),
+        os.path.join(OUTDIR, "Fig3_regime_barplot.pdf"),
+        fixed_dim=fixed_dim
+    )
 
-logprint("\n✓ Figures saved (PNG+PDF): Fig1–Fig5")
+    plot_fig4_trace_acf(
+        res2,
+        os.path.join(OUTDIR, "Fig4_trace_acf_illconditioned.png"),
+        os.path.join(OUTDIR, "Fig4_trace_acf_illconditioned.pdf")
+    )
 
-# -------------------------------------------------------------------------
-# Captions
-# -------------------------------------------------------------------------
-write_caption_drafts(os.path.join(OUTDIR, "captions_draft.txt"))
-logprint(f"✓ Caption drafts saved: {OUTDIR}/captions_draft.txt")
+    best_ill = max(res2, key=lambda x: x["ESS_eval"])
+    plot_fig5_marginals(
+        best_ill,
+        os.path.join(OUTDIR, "Fig5_posterior_marginals.png"),
+        os.path.join(OUTDIR, "Fig5_posterior_marginals.pdf"),
+        burn=best_ill["burn"]
+    )
 
-# -------------------------------------------------------------------------
-# END
-# -------------------------------------------------------------------------
-t_global1 = time.time()
-logprint("\n" + "=" * 90)
-logprint(f"COMPLETE — Total runtime: {t_global1 - t_global0:.2f} seconds")
-logprint("=" * 90)
+    logprint("\n✓ Figures saved (PNG+PDF): Fig1–Fig5")
+
+    # -------------------------------------------------------------------------
+    # Captions
+    # -------------------------------------------------------------------------
+    write_caption_drafts(os.path.join(OUTDIR, "captions_draft.txt"))
+    logprint(f"✓ Caption drafts saved: {OUTDIR}/captions_draft.txt")
+
+    # -------------------------------------------------------------------------
+    # END
+    # -------------------------------------------------------------------------
+    t_global1 = time.time()
+    logprint("\n" + "=" * 90)
+    logprint(f"COMPLETE — Total runtime: {t_global1 - t_global0:.2f} seconds")
+    logprint("=" * 90)
