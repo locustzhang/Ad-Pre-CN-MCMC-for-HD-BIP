@@ -1,0 +1,1076 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+================================================================================
+ULTIMATE REVIEWER-PROOF PAPER SCRIPT (FIGURE 1–5 LAYOUT) — FINAL (NO MTM VERSION)
+================================================================================
+
+Algorithms:
+  (1) Vanilla pCN
+  (2) Adaptive-ESS pCN
+  (3) Dual-signal pCN
+
+Experiments (5 total):
+  Exp0: BaselineScan (dim=10..100)
+  Exp1: WellConditioned (dim=80)
+  Exp2: IllConditioned  (dim=80)
+  Exp3: LowSNR          (dim=80)
+  Exp4: HighSNR         (dim=80)
+
+Outputs:
+  Figures: Fig1–Fig5 (PNG+PDF)
+  Tables: Table_Main.txt + Table_S1–S5
+  Captions: captions_draft.txt
+  JSONL summary: results_all.jsonl
+  NPZ full samples: results_samples_full.npz
+
+Reviewer-proof design:
+  - Fair posterior evaluation budget (eval_budget per chain).
+  - Adaptation frozen after burn-in.
+  - ESS computed as concat ESS and min-chain ESS.
+  - Split-Rhat computed from split chains.
+  - Clean Science/Nature style plotting.
+
+================================================================================
+"""
+
+import os
+import math
+import time
+import json
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from tabulate import tabulate
+
+try:
+    from tqdm.auto import tqdm
+    TQDM_AVAILABLE = True
+except Exception:
+    TQDM_AVAILABLE = False
+
+
+# =============================================================================
+# Global config
+# =============================================================================
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DTYPE = torch.float64
+torch.set_default_dtype(DTYPE)
+
+OUTDIR = "paper_results_ULTIMATE_FINAL_NO_MTM"
+os.makedirs(OUTDIR, exist_ok=True)
+
+LOGFILE = os.path.join(OUTDIR, "run_log.txt")
+
+
+def logprint(msg):
+    print(msg)
+    with open(LOGFILE, "a", encoding="utf-8") as f:
+        f.write(msg + "\n")
+
+
+with open(LOGFILE, "w", encoding="utf-8") as f:
+    f.write("")
+
+logprint(f"Device={DEVICE} | dtype={DTYPE} | seed={SEED}")
+logprint(f"Output folder: {OUTDIR}")
+
+
+# =============================================================================
+# ENHANCED PLOT STYLE (Science/Nature/PNAS Style) — Reviewer-Proof
+# =============================================================================
+plt.rcParams.update({
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
+    "font.size": 10,
+    "axes.titlesize": 11,
+    "axes.labelsize": 10,
+    "legend.fontsize": 9,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "axes.linewidth": 0.8,
+    "grid.alpha": 0.15,
+    "grid.linestyle": "--",
+    "figure.dpi": 220,
+    "savefig.dpi": 400,
+    "savefig.transparent": False,
+})
+
+# Color-blind friendly high-contrast palette
+METHODS = ["Vanilla pCN", "Adap-ESS pCN", "Dual-signal pCN"]
+
+METHOD_COLORS = {
+    "Vanilla pCN": "#2166ac",     # blue
+    "Adap-ESS pCN": "#b2182b",    # red
+    "Dual-signal pCN": "#1a9850", # green
+}
+
+MARKERS = {
+    "Vanilla pCN": "o",
+    "Adap-ESS pCN": "s",
+    "Dual-signal pCN": "^",
+}
+
+LINESTYLES = {
+    "Vanilla pCN": "-",
+    "Adap-ESS pCN": "--",
+    "Dual-signal pCN": "-.",
+}
+
+
+def add_panel_label(ax, label):
+    ax.text(
+        -0.12, 1.08, f"({label})",
+        transform=ax.transAxes,
+        fontsize=13,
+        fontweight="bold",
+        va="top",
+        ha="left"
+    )
+
+
+def clean_axes(ax, grid=True):
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    if grid:
+        ax.grid(True, alpha=0.18, linewidth=0.6)
+
+
+# =============================================================================
+# Posterior evaluation counter
+# =============================================================================
+class EvalCounter:
+    def __init__(self):
+        self.count = 0
+
+    def reset(self):
+        self.count = 0
+
+    def inc(self, k=1):
+        self.count += int(k)
+
+
+EVAL = EvalCounter()
+
+
+# =============================================================================
+# Log-likelihood and log-prior
+# =============================================================================
+def log_likelihood(x, AtA, Aty, sigma):
+    quad_like = torch.dot(x, AtA @ x) - 2.0 * torch.dot(x, Aty)
+    return -0.5 * quad_like / (sigma ** 2)
+
+
+def log_prior(x, invL):
+    quad_prior = torch.dot(x * invL, x)
+    return -0.5 * quad_prior
+
+
+def log_posterior(x, invL, AtA, Aty, sigma):
+    return log_likelihood(x, AtA, Aty, sigma) + log_prior(x, invL)
+
+
+# =============================================================================
+# ESS utilities
+# =============================================================================
+def ess_1d(series):
+    series = np.asarray(series, dtype=np.float64)
+    n = len(series)
+    if n < 30:
+        return float(max(1, n))
+    if np.allclose(series, series[0], atol=1e-12):
+        return 1.0
+
+    series = series - series.mean()
+    ac = np.correlate(series, series, mode="full")[n-1:]
+    ac = ac / (ac[0] + 1e-30)
+
+    cutoff = min(n, 4000)
+    for k in range(1, cutoff):
+        if ac[k] < 0:
+            cutoff = k
+            break
+
+    tau = 1.0 + 2.0 * np.sum(ac[1:cutoff])
+    ess = n / max(tau, 1e-12)
+    return float(max(1.0, min(n, ess)))
+
+
+def ess_mean(samples):
+    samples = np.asarray(samples, dtype=np.float64)
+    d = samples.shape[1]
+    return float(np.mean([ess_1d(samples[:, i]) for i in range(d)]))
+
+
+def ess_min(samples):
+    samples = np.asarray(samples, dtype=np.float64)
+    d = samples.shape[1]
+    return float(np.min([ess_1d(samples[:, i]) for i in range(d)]))
+
+
+# =============================================================================
+# Split-Rhat
+# =============================================================================
+def split_rhat(chains):
+    chains = np.asarray(chains, dtype=np.float64)
+    m, n, d = chains.shape
+    if n < 50:
+        return np.ones(d)
+
+    n2 = n // 2
+    split = np.concatenate([chains[:, :n2, :], chains[:, n2:2*n2, :]], axis=0)
+
+    chain_means = split.mean(axis=1)
+    chain_vars = split.var(axis=1, ddof=1)
+
+    W = chain_vars.mean(axis=0)
+    B = n2 * chain_means.var(axis=0, ddof=1)
+
+    var_hat = ((n2 - 1) / n2) * W + (1 / n2) * B
+    Rhat = np.sqrt(var_hat / np.maximum(W, 1e-14))
+    return Rhat
+
+
+# =============================================================================
+# Smooth switching
+# =============================================================================
+def smooth_w(t, t0, s=0.2):
+    return 1.0 / (1.0 + math.exp(-(t - t0) / (s * t0 + 1e-12)))
+
+
+# =============================================================================
+# pCN Vanilla
+# =============================================================================
+def pcn_vanilla(x0, invL, sqrtL, AtA, Aty, sigma, beta, N):
+    dim = x0.numel()
+    x = x0.clone().flatten()
+    samples = np.empty((N, dim), dtype=np.float64)
+
+    acc = 0
+    t0 = time.time()
+
+    lp_x = float(log_posterior(x, invL, AtA, Aty, sigma))
+    EVAL.inc(1)
+
+    a = math.sqrt(max(1.0 - beta**2, 1e-12))
+
+    for i in range(N):
+        xi = torch.randn_like(x)
+        y = a * x + beta * sqrtL * xi
+
+        lp_y = float(log_posterior(y, invL, AtA, Aty, sigma))
+        EVAL.inc(1)
+
+        log_acc = min(0.0, lp_y - lp_x)
+        if torch.rand(()) < math.exp(log_acc):
+            x = y
+            lp_x = lp_y
+            acc += 1
+
+        samples[i] = x.detach().cpu().numpy()
+
+    return samples, acc / N, time.time() - t0
+
+
+# =============================================================================
+# Adaptive pCN (Robbins-Monro acceptance targeting)
+# =============================================================================
+def pcn_adap_ess(x0, invL, sqrtL, AtA, Aty, sigma, beta0, N, dim, adapt_stop):
+    x = x0.clone().flatten()
+    samples = np.empty((N, dim), dtype=np.float64)
+
+    logb = math.log(beta0)
+    scale = 1.0 / math.sqrt(dim)
+    logb_min = math.log(0.004 * scale)
+    logb_max = math.log(0.90 * scale)
+
+    acc = 0
+    t0 = time.time()
+
+    lp_x = float(log_posterior(x, invL, AtA, Aty, sigma))
+    EVAL.inc(1)
+
+    for i in range(N):
+        b = math.exp(logb)
+        a = math.sqrt(max(1.0 - b**2, 1e-12))
+
+        xi = torch.randn_like(x)
+        y = a * x + b * sqrtL * xi
+
+        lp_y = float(log_posterior(y, invL, AtA, Aty, sigma))
+        EVAL.inc(1)
+
+        log_acc = min(0.0, lp_y - lp_x)
+        if torch.rand(()) < math.exp(log_acc):
+            x = y
+            lp_x = lp_y
+            acc += 1
+
+        samples[i] = x.detach().cpu().numpy()
+
+        if i < adapt_stop and i > 0 and i % 200 == 0:
+            ar = acc / i
+            logb += 0.12 / math.sqrt(i / 200) * (ar - 0.234)
+            logb = float(np.clip(logb, logb_min, logb_max))
+
+    return samples, acc / N, time.time() - t0
+
+
+# =============================================================================
+# Dual-signal pCN
+# =============================================================================
+def pcn_dual(x0, invL, sqrtL, AtA, Aty, sigma, beta0, N, t_switch, dim, adapt_stop):
+    x = x0.clone().flatten()
+    samples = np.empty((N, dim), dtype=np.float64)
+
+    logb = math.log(beta0)
+    scale = 1.0 / math.sqrt(dim)
+    logb_min = math.log(0.004 * scale)
+    logb_max = math.log(0.90 * scale)
+
+    acc = 0
+    t0 = time.time()
+
+    lp_x = float(log_posterior(x, invL, AtA, Aty, sigma))
+    EVAL.inc(1)
+
+    for i in range(N):
+        b = math.exp(logb)
+        a = math.sqrt(max(1.0 - b**2, 1e-12))
+
+        xi = torch.randn_like(x)
+        y = a * x + b * sqrtL * xi
+
+        lp_y = float(log_posterior(y, invL, AtA, Aty, sigma))
+        EVAL.inc(1)
+
+        log_acc = min(0.0, lp_y - lp_x)
+        if torch.rand(()) < math.exp(log_acc):
+            x = y
+            lp_x = lp_y
+            acc += 1
+
+        samples[i] = x.detach().cpu().numpy()
+
+        if i < adapt_stop and i > 0 and i % 200 == 0:
+            ar = acc / i
+            w = smooth_w(i, t_switch)
+
+            g_acc = ar - 0.234
+            g_ess = 0.0
+
+            if i > 2500:
+                blk = samples[i-2000:i]
+                g_ess = np.clip((ess_mean(blk) / 2000.0) - 0.5, -1.0, 1.0)
+
+            logb += 0.10 / math.sqrt(i / 200) * ((1 - w) * g_acc + w * g_ess)
+            logb = float(np.clip(logb, logb_min, logb_max))
+
+    return samples, acc / N, time.time() - t0
+
+
+# =============================================================================
+# Build experiment instance
+# =============================================================================
+def build_problem(dim, sigma=0.5, cond_level=20.0, snr_level=1.0):
+    sqrtL = torch.linspace(0.5, 4.0, dim, device=DEVICE, dtype=DTYPE)
+    invL = 1.0 / (sqrtL ** 2)
+
+    U, _ = torch.linalg.qr(torch.randn(dim, dim, device=DEVICE, dtype=DTYPE))
+    V, _ = torch.linalg.qr(torch.randn(dim, dim, device=DEVICE, dtype=DTYPE))
+
+    s = torch.linspace(1.0, 1.0 / cond_level, dim, device=DEVICE, dtype=DTYPE)
+    A = U @ torch.diag(s) @ V.T
+
+    x_true = torch.randn(dim, device=DEVICE, dtype=DTYPE) * 0.5
+
+    noise_sigma = sigma / snr_level
+    noise = noise_sigma * torch.randn(dim, device=DEVICE, dtype=DTYPE)
+
+    y = A @ x_true + noise
+
+    AtA = A.T @ A
+    Aty = A.T @ y
+
+    Precision = AtA / (noise_sigma ** 2) + torch.diag(invL)
+    b = Aty / (noise_sigma ** 2)
+
+    x_map = torch.linalg.solve(Precision, b)
+    Sigma_true = torch.inverse(Precision).cpu().numpy()
+
+    sig_norm = float(torch.norm(A @ x_true).detach().cpu().item())
+    noise_norm = float(torch.norm(noise).detach().cpu().item()) + 1e-30
+    snr_ratio = sig_norm / noise_norm
+    snr_db = 20.0 * math.log10(max(snr_ratio, 1e-30))
+
+    geom = {
+        "cr": float(np.clip(1.0 / cond_level, 0.0, 1.0)),
+        "cond": float(cond_level),
+        "snr_db": float(snr_db),
+    }
+
+    return {
+        "sqrtL": sqrtL,
+        "invL": invL,
+        "A": A,
+        "singular_vals": s.detach().cpu().numpy(),
+        "AtA": AtA,
+        "Aty": Aty,
+        "sigma": noise_sigma,
+        "x_true": x_true,
+        "x0": x_map,
+        "Sigma_true": Sigma_true,
+        "geom": geom,
+    }
+
+
+# =============================================================================
+# Summaries
+# =============================================================================
+def summarize_multichain(chains, burn, x_true_np, Sigma_true):
+    post_chains = [c[burn:] for c in chains]
+    post_all = np.concatenate(post_chains, axis=0)
+
+    mu_est = post_all.mean(axis=0)
+    cov_est = np.cov(post_all, rowvar=False)
+
+    err_mu = np.linalg.norm(mu_est - x_true_np) / (np.linalg.norm(x_true_np) + 1e-12)
+    err_cov = np.linalg.norm(cov_est - Sigma_true, ord="fro") / (np.linalg.norm(Sigma_true, ord="fro") + 1e-12)
+
+    ess_concat = ess_mean(post_all)
+
+    ess_chain = [ess_mean(c) for c in post_chains]
+    ess_minchain = float(np.min(ess_chain))
+
+    rhat = split_rhat(np.stack(post_chains, axis=0))
+    rhat_max = float(np.max(rhat))
+
+    contract = float(np.trace(cov_est) / (np.trace(Sigma_true) + 1e-12))
+
+    ci = []
+    for j in range(min(2, post_all.shape[1])):
+        q = np.quantile(post_all[:, j], [0.025, 0.5, 0.975])
+        ci.append((float(q[0]), float(q[1]), float(q[2])))
+
+    return {
+        "mu_est": mu_est,
+        "cov_est": cov_est,
+        "err_mu": float(err_mu),
+        "err_cov": float(err_cov),
+        "ess_concat": float(ess_concat),
+        "ess_minchain": float(ess_minchain),
+        "rhat_max": float(rhat_max),
+        "contract": float(contract),
+        "ci": ci,
+    }
+
+
+# =============================================================================
+# Autocorrelation
+# =============================================================================
+def autocorr(x, max_lag=200):
+    x = np.asarray(x, dtype=np.float64)
+    x = x - x.mean()
+    n = len(x)
+    ac = np.correlate(x, x, mode="full")[n-1:]
+    ac = ac / (ac[0] + 1e-30)
+    return ac[:max_lag]
+
+
+# =============================================================================
+# FIGURE 1
+# =============================================================================
+def plot_fig1(entry, outfile_png, outfile_pdf):
+    svals = np.asarray(entry["singular_vals"], dtype=np.float64)
+    prior_std = np.asarray(entry["prior_std"], dtype=np.float64)
+    dim = int(entry["dim"])
+
+    fig, axes = plt.subplots(1, 3, figsize=(12.2, 3.6))
+    labels = ["a", "b", "c"]
+
+    x = np.arange(1, dim + 1)
+
+    axes[0].plot(x, svals, color="#333333", lw=1.6)
+    axes[0].fill_between(x, svals, color="#333333", alpha=0.10)
+    axes[0].set_title("Forward spectrum", pad=8)
+    axes[0].set_xlabel("Index $i$")
+    axes[0].set_ylabel("Singular value $\\sigma_i$")
+
+    axes[1].plot(
+        x, prior_std,
+        color="#2c7fb8", lw=1.6,
+        marker="o", markersize=2.5, markevery=max(1, dim // 20)
+    )
+    axes[1].set_title("Prior scale", pad=8)
+    axes[1].set_xlabel("Index $i$")
+    axes[1].set_ylabel("$\\sqrt{L_{ii}}$")
+
+    proxy = 1.0 / (1.0 + svals**2)
+    axes[2].bar(x, proxy, color="#f03b20", alpha=0.55, width=0.9)
+    axes[2].set_title("Contraction proxy", pad=8)
+    axes[2].set_xlabel("Index $i$")
+    axes[2].set_ylabel("$(1+\\sigma_i^2)^{-1}$")
+
+    for i, ax in enumerate(axes):
+        add_panel_label(ax, labels[i])
+        clean_axes(ax)
+
+    plt.tight_layout()
+    plt.savefig(outfile_png, bbox_inches="tight")
+    plt.savefig(outfile_pdf, bbox_inches="tight")
+    plt.close(fig)
+
+
+# =============================================================================
+# FIGURE 2
+# =============================================================================
+def plot_fig2_baseline(res0, outfile_png, outfile_pdf):
+    dims = sorted(list(set([r["dim"] for r in res0])))
+
+    fig, axes = plt.subplots(2, 2, figsize=(11.3, 8.2))
+    axes = axes.flatten()
+    labels = ["a", "b", "c", "d"]
+
+    metrics = ["ESS_s", "ESS_eval", "Rhat", "AR"]
+    titles = [
+        "Absolute efficiency (ESS/s)",
+        "Algorithmic efficiency (ESS/eval)",
+        "Convergence diagnostic (Split-$\\hat{R}$)",
+        "Acceptance rate",
+    ]
+    ylabels = ["ESS/s", "ESS/eval", "Split-$\\hat{R}$", "AR"]
+
+    for i, metric in enumerate(metrics):
+        ax = axes[i]
+
+        for method in METHODS:
+            rr = sorted([r for r in res0 if r["method"] == method], key=lambda x: x["dim"])
+            ax.plot(
+                [x["dim"] for x in rr],
+                [x[metric] for x in rr],
+                marker=MARKERS[method],
+                markersize=5,
+                lw=1.8,
+                linestyle=LINESTYLES[method],
+                color=METHOD_COLORS[method],
+                label=method
+            )
+
+        ax.set_title(titles[i], pad=8)
+        ax.set_xlabel("Dimension $d$")
+        ax.set_ylabel(ylabels[i])
+        add_panel_label(ax, labels[i])
+        clean_axes(ax)
+
+        if metric == "Rhat":
+            ax.axhline(1.1, color="#666666", linestyle=":", lw=1.2, alpha=0.8)
+        if metric == "AR":
+            ax.axhline(0.234, color="#666666", linestyle="--", lw=1.2, alpha=0.7)
+
+        ax.set_xticks(dims)
+
+    axes[0].legend(frameon=False, loc="upper right", ncol=1)
+
+    plt.tight_layout()
+    plt.savefig(outfile_png, bbox_inches="tight")
+    plt.savefig(outfile_pdf, bbox_inches="tight")
+    plt.close(fig)
+
+
+# =============================================================================
+# FIGURE 3
+# =============================================================================
+def plot_fig3_regime(all_results, outfile_png, outfile_pdf, fixed_dim=80):
+    regimes = ["WellConditioned", "IllConditioned", "LowSNR", "HighSNR"]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.2, 4.6))
+
+    width = 0.24
+    xbase = np.arange(len(regimes))
+
+    for mi, method in enumerate(METHODS):
+        vals_s = []
+        vals_ev = []
+        for reg in regimes:
+            rr = [r for r in all_results if r["exp"] == reg and r["dim"] == fixed_dim and r["method"] == method]
+            vals_s.append(rr[0]["ESS_s"])
+            vals_ev.append(rr[0]["ESS_eval"])
+
+        ax1.bar(
+            xbase + (mi - 1.0) * width,
+            vals_s,
+            width=width,
+            label=method,
+            color=METHOD_COLORS[method],
+            edgecolor="white",
+            linewidth=0.6,
+            alpha=0.90
+        )
+
+        ax2.bar(
+            xbase + (mi - 1.0) * width,
+            vals_ev,
+            width=width,
+            label=method,
+            color=METHOD_COLORS[method],
+            edgecolor="white",
+            linewidth=0.6,
+            alpha=0.90
+        )
+
+    ax1.set_title(f"Efficiency by regime ($d={fixed_dim}$)", pad=8)
+    ax1.set_ylabel("ESS/s")
+    ax1.set_xticks(xbase)
+    ax1.set_xticklabels(regimes, rotation=12)
+
+    ax2.set_title(f"Evaluation economy ($d={fixed_dim}$)", pad=8)
+    ax2.set_ylabel("ESS/eval")
+    ax2.set_xticks(xbase)
+    ax2.set_xticklabels(regimes, rotation=12)
+
+    add_panel_label(ax1, "a")
+    add_panel_label(ax2, "b")
+
+    clean_axes(ax1, grid=True)
+    clean_axes(ax2, grid=True)
+
+    ax2.legend(frameon=False, bbox_to_anchor=(1.02, 1.0), loc="upper left")
+
+    plt.tight_layout()
+    plt.savefig(outfile_png, bbox_inches="tight")
+    plt.savefig(outfile_pdf, bbox_inches="tight")
+    plt.close(fig)
+
+
+# =============================================================================
+# FIGURE 4
+# =============================================================================
+def plot_fig4_trace_acf(res_ill, outfile_png, outfile_pdf):
+    fixed_dim = res_ill[0]["dim"]
+
+    fig, axes = plt.subplots(2, 2, figsize=(11.3, 7.6))
+    axes = axes.flatten()
+
+    max_trace_len = 3000
+    max_acf_lag = 200
+
+    for method in METHODS:
+        entry = [r for r in res_ill if r["method"] == method][0]
+        chain = entry["chains"][0]
+        color = METHOD_COLORS[method]
+
+        axes[0].plot(chain[:max_trace_len, 0], color=color, alpha=0.70, lw=0.7, label=method)
+        axes[2].plot(chain[:max_trace_len, 1], color=color, alpha=0.70, lw=0.7)
+
+        ac0 = autocorr(chain[:8000, 0], max_lag=max_acf_lag)
+        ac1 = autocorr(chain[:8000, 1], max_lag=max_acf_lag)
+
+        axes[1].plot(ac0, color=color, lw=1.6)
+        axes[3].plot(ac1, color=color, lw=1.6)
+
+    axes[0].set_title(f"Trace plot $x_1$ (ill-conditioned, $d={fixed_dim}$)", loc="left", pad=6)
+    axes[1].set_title(f"ACF $x_1$ (ill-conditioned, $d={fixed_dim}$)", loc="left", pad=6)
+    axes[2].set_title(f"Trace plot $x_2$ (ill-conditioned, $d={fixed_dim}$)", loc="left", pad=6)
+    axes[3].set_title(f"ACF $x_2$ (ill-conditioned, $d={fixed_dim}$)", loc="left", pad=6)
+
+    axes[0].set_xlabel("Iteration")
+    axes[0].set_ylabel("$x_1$")
+    axes[2].set_xlabel("Iteration")
+    axes[2].set_ylabel("$x_2$")
+
+    axes[1].set_xlabel("Lag")
+    axes[1].set_ylabel("ACF")
+    axes[3].set_xlabel("Lag")
+    axes[3].set_ylabel("ACF")
+
+    for i, ax in enumerate(axes):
+        add_panel_label(ax, ["a", "b", "c", "d"][i])
+        clean_axes(ax)
+
+        if i in [1, 3]:
+            ax.axhline(0.0, color="#555555", lw=1.0, alpha=0.4)
+
+    axes[0].legend(frameon=False, ncol=3, loc="upper right")
+
+    plt.tight_layout()
+    plt.savefig(outfile_png, bbox_inches="tight")
+    plt.savefig(outfile_pdf, bbox_inches="tight")
+    plt.close(fig)
+
+
+# =============================================================================
+# FIGURE 5
+# =============================================================================
+def plot_fig5_marginals(entry, outfile_png, outfile_pdf, burn):
+    chains = entry["chains"]
+    method = entry["method"]
+    exp = entry["exp"]
+    dim = entry["dim"]
+
+    post = np.concatenate([c[burn:] for c in chains], axis=0)
+    x0 = post[:, 0]
+    x1 = post[:, 1]
+
+    rng = np.random.default_rng(12345)
+    n_scatter = min(len(x0), 6000)
+    idx = rng.choice(len(x0), size=n_scatter, replace=False)
+
+    color = METHOD_COLORS[method]
+
+    fig = plt.figure(figsize=(8.4, 7.2))
+    gs = fig.add_gridspec(
+        2, 2,
+        width_ratios=[4, 1.2],
+        height_ratios=[1.2, 4],
+        wspace=0.05,
+        hspace=0.05
+    )
+
+    ax_histx = fig.add_subplot(gs[0, 0])
+    ax_main = fig.add_subplot(gs[1, 0])
+    ax_histy = fig.add_subplot(gs[1, 1])
+
+    ax_main.hist2d(x0, x1, bins=80, density=True, cmap="Greys", alpha=0.50)
+    ax_main.scatter(x0[idx], x1[idx], s=2.5, alpha=0.18, color=color)
+
+    ax_histx.hist(x0, bins=90, density=True, alpha=0.45, color=color)
+    ax_histy.hist(x1, bins=90, density=True, alpha=0.45, color=color, orientation="horizontal")
+
+    ax_histx.axis("off")
+    ax_histy.axis("off")
+
+    ax_main.set_xlabel("$x_1$")
+    ax_main.set_ylabel("$x_2$")
+    ax_main.set_title(f"Posterior geometry | {method} | {exp} | $d={dim}$", pad=10)
+
+    clean_axes(ax_main, grid=True)
+
+    plt.tight_layout()
+    plt.savefig(outfile_png, bbox_inches="tight")
+    plt.savefig(outfile_pdf, bbox_inches="tight")
+    plt.close(fig)
+
+
+# =============================================================================
+# JSONL writer
+# =============================================================================
+def append_jsonl(path, obj):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj) + "\n")
+
+
+# =============================================================================
+# Captions generator
+# =============================================================================
+def write_caption_drafts(outfile):
+    txt = []
+    txt.append("FIGURE CAPTION DRAFTS (SCIENCE/NATURE METHODS STYLE)")
+    txt.append("=" * 80)
+
+    txt.append("\nFigure 1 | Problem setup and spectral structure.")
+    txt.append("Left: singular spectrum of the forward operator A. Middle: diagonal prior standard deviation.")
+    txt.append("Right: posterior contraction proxy 1/(1+σ_i^2), illustrating ill-conditioning effects.")
+
+    txt.append("\nFigure 2 | Baseline dimension scaling (d=10–100).")
+    txt.append("Four-panel scaling comparison of ESS/s, ESS/eval, Split-Rhat, and acceptance rate for all samplers.")
+
+    txt.append("\nFigure 3 | Robustness across inference regimes (d=80).")
+    txt.append("Barplots comparing ESS/s and ESS/eval across well-conditioned, ill-conditioned, low-SNR, and high-SNR settings.")
+
+    txt.append("\nFigure 4 | Trace and autocorrelation comparison (ill-conditioned regime).")
+    txt.append("Trace plots and autocorrelation functions for the first two coordinates, highlighting mixing behavior.")
+
+    txt.append("\nFigure 5 | Posterior geometry visualization (best sampler in ill-conditioned regime).")
+    txt.append("Joint posterior density plot and marginal histograms for the first two coordinates after burn-in.")
+
+    with open(outfile, "w", encoding="utf-8") as f:
+        f.write("\n".join(txt))
+
+
+# =============================================================================
+# Table writer
+# =============================================================================
+def make_table(results_subset, title, outfile):
+    rows = []
+    for r in results_subset:
+        ci_txt = ""
+        if len(r["ci"]) >= 2:
+            ci_txt = (
+                f"x0={r['ci'][0][1]:.3f}[{r['ci'][0][0]:.3f},{r['ci'][0][2]:.3f}] | "
+                f"x1={r['ci'][1][1]:.3f}[{r['ci'][1][0]:.3f},{r['ci'][1][2]:.3f}]"
+            )
+
+        rows.append([
+            r["exp"], r["dim"], r["method"],
+            f"{r['AR']:.3f}",
+            f"{r['ESS_concat']:.1f}",
+            f"{r['ESS_minchain']:.1f}",
+            f"{r['ESS_s']:.3f}",
+            f"{r['ESS_eval']:.6f}",
+            f"{r['Rhat']:.3f}",
+            f"{r['Err_mu']:.3f}",
+            f"{r['Err_cov']:.3f}",
+            f"{r['Contract']:.3f}",
+            f"{r['Time']:.2f}",
+            ci_txt
+        ])
+
+    headers = ["Exp", "Dim", "Method", "AR",
+               "ESS(concat)", "ESS(minchain)", "ESS/s", "ESS/eval",
+               "Rhat", "Err_mu", "Err_cov", "Contract", "Time", "CI(95%)"]
+
+    table_txt = tabulate(rows, headers=headers, tablefmt="grid")
+
+    logprint("\n" + "=" * 120)
+    logprint(title)
+    logprint("=" * 120)
+    logprint(table_txt)
+
+    with open(outfile, "w", encoding="utf-8") as f:
+        f.write(table_txt)
+
+
+# =============================================================================
+# Experiment runner
+# =============================================================================
+def run_experiment(exp_name, dim_list, n_chains=4, eval_budget=20000):
+
+    logprint("\n" + "=" * 92)
+    logprint(f"Experiment: {exp_name}")
+    logprint("=" * 92)
+
+    results = []
+
+    outer_iter = dim_list
+    if TQDM_AVAILABLE:
+        outer_iter = tqdm(dim_list, desc=f"[{exp_name}] dims", leave=False)
+
+    for dim in outer_iter:
+
+        if exp_name == "BaselineScan":
+            prob = build_problem(dim, sigma=0.5, cond_level=20.0, snr_level=1.0)
+        elif exp_name == "WellConditioned":
+            prob = build_problem(dim, sigma=0.5, cond_level=2.0, snr_level=1.0)
+        elif exp_name == "IllConditioned":
+            prob = build_problem(dim, sigma=0.5, cond_level=200.0, snr_level=1.0)
+        elif exp_name == "LowSNR":
+            prob = build_problem(dim, sigma=0.5, cond_level=20.0, snr_level=0.35)
+        elif exp_name == "HighSNR":
+            prob = build_problem(dim, sigma=0.5, cond_level=20.0, snr_level=2.5)
+        else:
+            prob = build_problem(dim, sigma=0.5, cond_level=20.0, snr_level=1.0)
+
+        sqrtL = prob["sqrtL"]
+        invL = prob["invL"]
+        AtA = prob["AtA"]
+        Aty = prob["Aty"]
+        sigma = prob["sigma"]
+        x_true = prob["x_true"].cpu().numpy()
+        Sigma_true = prob["Sigma_true"]
+        x0 = prob["x0"]
+        geom = prob["geom"]
+
+        init_beta = 0.2 / math.sqrt(dim)
+
+        logprint(f"\n--- dim={dim} | sigma={sigma:.4f} | cond={geom['cond']:.1f} | snr_db={geom['snr_db']:.2f} ---")
+
+        for method in METHODS:
+
+            # -------------------------------------------------------------
+            # Fairness: same posterior evaluation budget (strict)
+            # -------------------------------------------------------------
+            N = eval_budget - 1
+
+            burn_frac = 0.30
+            burn = int(N * burn_frac)
+            adapt_stop = burn
+
+            logprint(f"\n  [{method}] eval_budget={eval_budget}, N={N}, burn={burn}, adapt_stop={adapt_stop}")
+
+            chains = []
+            times = []
+            ars = []
+            eval_counts = []
+
+            chain_iter = range(n_chains)
+            if TQDM_AVAILABLE:
+                chain_iter = tqdm(chain_iter, desc=f"{method} chains (d={dim})", leave=False)
+
+            for c in chain_iter:
+                x_init = x0 + 0.05 * sqrtL * torch.randn(dim, device=DEVICE, dtype=DTYPE)
+
+                EVAL.reset()
+
+                if method == "Vanilla pCN":
+                    s, ar, t = pcn_vanilla(x_init, invL, sqrtL, AtA, Aty, sigma, init_beta, N)
+
+                elif method == "Adap-ESS pCN":
+                    s, ar, t = pcn_adap_ess(x_init, invL, sqrtL, AtA, Aty, sigma, init_beta, N, dim, adapt_stop)
+
+                else:
+                    s, ar, t = pcn_dual(x_init, invL, sqrtL, AtA, Aty, sigma, init_beta, N,
+                                        int(0.5 * adapt_stop), dim, adapt_stop)
+
+                chains.append(s)
+                times.append(t)
+                ars.append(ar)
+                eval_counts.append(EVAL.count)
+
+                logprint(f"    chain {c} | AR={ar:.3f} | time={t:.2f}s | eval={EVAL.count}")
+
+            summary = summarize_multichain(chains, burn, x_true, Sigma_true)
+
+            ess_val = summary["ess_concat"]
+            ess_minchain = summary["ess_minchain"]
+
+            ess_s = ess_val / max(np.mean(times), 1e-12)
+            ess_eval = ess_val / max(np.mean(eval_counts), 1e-12)
+
+            entry = {
+                "exp": exp_name,
+                "dim": dim,
+                "method": method,
+                "AR": float(np.mean(ars)),
+                "ESS_concat": float(ess_val),
+                "ESS_minchain": float(ess_minchain),
+                "ESS_s": float(ess_s),
+                "ESS_eval": float(ess_eval),
+                "Rhat": float(summary["rhat_max"]),
+                "Err_mu": float(summary["err_mu"]),
+                "Err_cov": float(summary["err_cov"]),
+                "Contract": float(summary["contract"]),
+                "Time": float(np.mean(times)),
+                "burn": int(burn),
+                "eval_mean": float(np.mean(eval_counts)),
+                "ci": summary["ci"],
+                "chains": chains,
+                "singular_vals": prob["singular_vals"],
+                "prior_std": prob["sqrtL"].detach().cpu().numpy(),
+            }
+
+            results.append(entry)
+
+    return results
+
+
+# =============================================================================
+# MAIN EXECUTION (Jupyter-friendly)
+# =============================================================================
+t_global0 = time.time()
+
+baseline_dims = list(range(10, 101, 10))
+fixed_dim = 80
+eval_budget = 20000
+n_chains = 4
+
+# -------------------------------------------------------------------------
+# Run experiments
+# -------------------------------------------------------------------------
+res0 = run_experiment("BaselineScan", baseline_dims, n_chains=n_chains, eval_budget=eval_budget)
+res1 = run_experiment("WellConditioned", [fixed_dim], n_chains=n_chains, eval_budget=eval_budget)
+res2 = run_experiment("IllConditioned", [fixed_dim], n_chains=n_chains, eval_budget=eval_budget)
+res3 = run_experiment("LowSNR", [fixed_dim], n_chains=n_chains, eval_budget=eval_budget)
+res4 = run_experiment("HighSNR", [fixed_dim], n_chains=n_chains, eval_budget=eval_budget)
+
+all_results = res0 + res1 + res2 + res3 + res4
+
+# -------------------------------------------------------------------------
+# Save JSONL summary (no huge arrays)
+# -------------------------------------------------------------------------
+jsonl_path = os.path.join(OUTDIR, "results_all.jsonl")
+with open(jsonl_path, "w", encoding="utf-8") as f:
+    f.write("")
+
+for r in all_results:
+    r_small = {k: v for k, v in r.items() if k not in ["chains", "singular_vals", "prior_std"]}
+    append_jsonl(jsonl_path, r_small)
+
+logprint(f"\n✓ Saved JSONL: {OUTDIR}/results_all.jsonl")
+
+# -------------------------------------------------------------------------
+# Save full samples NPZ (for reproducibility)
+# -------------------------------------------------------------------------
+npz_dict = {}
+for i, r in enumerate(all_results):
+    key = f"{r['exp']}_d{r['dim']}_{r['method'].replace(' ', '_').replace('+','PLUS')}"
+    npz_dict[key] = np.stack(r["chains"], axis=0)
+
+np.savez_compressed(os.path.join(OUTDIR, "results_samples_full.npz"), **npz_dict)
+logprint(f"✓ Saved NPZ full samples: {OUTDIR}/results_samples_full.npz")
+
+# -------------------------------------------------------------------------
+# Save config
+# -------------------------------------------------------------------------
+config = {
+    "seed": SEED,
+    "dtype": str(DTYPE),
+    "device": str(DEVICE),
+    "baseline_dims": baseline_dims,
+    "fixed_dim": fixed_dim,
+    "methods": METHODS,
+    "eval_budget": eval_budget,
+    "n_chains": n_chains
+}
+
+with open(os.path.join(OUTDIR, "config_used.json"), "w", encoding="utf-8") as f:
+    json.dump(config, f, indent=2)
+
+logprint(f"✓ Saved config: {OUTDIR}/config_used.json")
+
+# -------------------------------------------------------------------------
+# Tables
+# -------------------------------------------------------------------------
+make_table(all_results, "MAIN TABLE (ALL EXPERIMENTS)", os.path.join(OUTDIR, "Table_Main.txt"))
+make_table(res0, "TABLE S1 (BaselineScan)", os.path.join(OUTDIR, "Table_S1_BaselineScan.txt"))
+make_table(res1, "TABLE S2 (WellConditioned)", os.path.join(OUTDIR, "Table_S2_WellConditioned.txt"))
+make_table(res2, "TABLE S3 (IllConditioned)", os.path.join(OUTDIR, "Table_S3_IllConditioned.txt"))
+make_table(res3, "TABLE S4 (LowSNR)", os.path.join(OUTDIR, "Table_S4_LowSNR.txt"))
+make_table(res4, "TABLE S5 (HighSNR)", os.path.join(OUTDIR, "Table_S5_HighSNR.txt"))
+
+# -------------------------------------------------------------------------
+# Figures
+# -------------------------------------------------------------------------
+fig1_entry = [r for r in res0 if r["dim"] == fixed_dim and r["method"] == "Vanilla pCN"][0]
+plot_fig1(fig1_entry,
+          os.path.join(OUTDIR, "Fig1_problem_setup.png"),
+          os.path.join(OUTDIR, "Fig1_problem_setup.pdf"))
+
+plot_fig2_baseline(res0,
+                   os.path.join(OUTDIR, "Fig2_baseline_scaling.png"),
+                   os.path.join(OUTDIR, "Fig2_baseline_scaling.pdf"))
+
+plot_fig3_regime(all_results,
+                 os.path.join(OUTDIR, "Fig3_regime_barplot.png"),
+                 os.path.join(OUTDIR, "Fig3_regime_barplot.pdf"),
+                 fixed_dim=fixed_dim)
+
+plot_fig4_trace_acf(res2,
+                    os.path.join(OUTDIR, "Fig4_trace_acf_illconditioned.png"),
+                    os.path.join(OUTDIR, "Fig4_trace_acf_illconditioned.pdf"))
+
+best_ill = max(res2, key=lambda x: x["ESS_eval"])
+plot_fig5_marginals(best_ill,
+                    os.path.join(OUTDIR, "Fig5_posterior_marginals.png"),
+                    os.path.join(OUTDIR, "Fig5_posterior_marginals.pdf"),
+                    burn=best_ill["burn"])
+
+logprint("\n✓ Figures saved (PNG+PDF): Fig1–Fig5")
+
+# -------------------------------------------------------------------------
+# Captions
+# -------------------------------------------------------------------------
+write_caption_drafts(os.path.join(OUTDIR, "captions_draft.txt"))
+logprint(f"✓ Caption drafts saved: {OUTDIR}/captions_draft.txt")
+
+# -------------------------------------------------------------------------
+# END
+# -------------------------------------------------------------------------
+t_global1 = time.time()
+logprint("\n" + "=" * 90)
+logprint(f"COMPLETE — Total runtime: {t_global1 - t_global0:.2f} seconds")
+logprint("=" * 90)
