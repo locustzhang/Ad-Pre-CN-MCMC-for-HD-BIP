@@ -1,0 +1,278 @@
+import numpy as np
+import torch
+import math
+import time
+from scipy.fftpack import fft, ifft
+import matplotlib.pyplot as plt
+from tabulate import tabulate
+
+# ------------------------------------------------------------------------------
+# Science 风格绘图设置（顶级期刊标准）
+# ------------------------------------------------------------------------------
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.size": 11,
+    "axes.linewidth": 0.8,
+    "axes.labelsize": 11,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 9,
+    "figure.dpi": 300,
+    "savefig.dpi": 600,
+    "axes.grid": True,
+    "grid.alpha": 0.2,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+})
+
+colors = ["#1f77b4", "#d62728", "#2ca02c"]
+labels = ["Vanilla pCN", "Adap-ESS pCN", "Dual-signal pCN"]
+
+# ------------------------------------------------------------------------------
+# 全局配置
+# ------------------------------------------------------------------------------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DTYPE = torch.float64
+torch.set_default_dtype(DTYPE)
+torch.manual_seed(42)
+np.random.seed(42)
+
+# ------------------------------------------------------------------------------
+# CQNLSE 正问题：三次+五次非线性
+# ------------------------------------------------------------------------------
+def solve_cqnlse(alpha, beta, L=20, N=64, T=0.5, nt=100):
+    x = np.linspace(-L/2, L/2, N)
+    dx = x[1] - x[0]
+    k = 2 * np.pi * np.fft.fftfreq(N, dx)
+    u = 1.5 / np.cosh(x)
+    lin_phase = np.exp(0.5 * 1j * k**2 * (T/nt))
+    for _ in range(nt):
+        u = ifft(lin_phase * fft(u))
+        u2 = np.abs(u)**2
+        nonlin_phase = np.exp(-1j * (alpha * u2 + beta * u2**2) * (T/nt))
+        u = u * nonlin_phase
+        u = ifft(lin_phase * fft(u))
+    return x, u
+
+# ------------------------------------------------------------------------------
+# 观测数据与先验
+# ------------------------------------------------------------------------------
+sigma_obs = 0.02
+alpha_true = 1.0
+beta_true  = 0.1
+
+x_grid, u_true = solve_cqnlse(alpha_true, beta_true)
+y_obs = u_true + sigma_obs * (np.random.randn(*u_true.shape) + 1j * np.random.randn(*u_true.shape))
+
+prior_mean = np.array([0.8, 0.2])
+prior_std  = np.array([0.2, 0.1])
+sqrtL = torch.tensor(prior_std, device=DEVICE)
+
+# ------------------------------------------------------------------------------
+# 后验概率
+# ------------------------------------------------------------------------------
+def log_posterior(theta):
+    alpha, beta = theta.cpu().numpy()
+    try:
+        _, u_pred = solve_cqnlse(alpha, beta)
+    except:
+        return -1e10
+    diff = u_pred - y_obs
+    log_like = -0.5 * np.sum(np.abs(diff)**2) / sigma_obs**2
+    diff_pr = theta.cpu().numpy() - prior_mean
+    log_prior = -0.5 * np.sum(diff_pr**2 / prior_std**2)
+    return float(log_like + log_prior)
+
+# ------------------------------------------------------------------------------
+# ESS 计算
+# ------------------------------------------------------------------------------
+def ess_1d(series):
+    n = len(series)
+    if n < 2: return 1.0
+    if np.allclose(series, series[0], atol=1e-9): return 1.0
+    s = series - series.mean()
+    ac = np.correlate(s, s, mode='full')[n-1:]
+    ac /= ac[0] + 1e-12
+    try:
+        cutoff = np.where(ac < 0)[0][0]
+    except:
+        cutoff = len(ac)
+    ess = n / (1 + 2 * np.sum(ac[1:cutoff]))
+    return max(ess, 1.0)
+
+def ess_mean(samples):
+    return np.mean([ess_1d(samples[:,i]) for i in range(samples.shape[1])])
+
+# ------------------------------------------------------------------------------
+# 三个算法
+# ------------------------------------------------------------------------------
+def pcn_vanilla(x0, beta, N):
+    x = x0.clone().flatten()
+    samples, acc = [], 0
+    t0 = time.time()
+    lp = log_posterior(x)
+    a = math.sqrt(max(1.0 - beta**2, 1e-6))
+    for _ in range(N):
+        xi = torch.randn_like(x)
+        y = a * x + beta * sqrtL * xi
+        lp_y = log_posterior(y)
+        if torch.rand(()) < math.exp(min(0.0, lp_y - lp)):
+            x, lp = y, lp_y
+            acc += 1
+        samples.append(x.cpu().numpy())
+    return np.array(samples), acc/N, time.time()-t0
+
+def pcn_adap_ess(x0, beta0, N, dim):
+    x = x0.clone().flatten()
+    logb = math.log(beta0)
+    scale = 1.0 / math.sqrt(dim)
+    logb_min, logb_max = math.log(0.01*scale), math.log(0.8*scale)
+    samples, acc = [], 0
+    t0 = time.time()
+    lp = log_posterior(x)
+    for i in range(N):
+        b = math.exp(logb)
+        a = math.sqrt(max(1.0 - b**2, 1e-6))
+        xi = torch.randn_like(x)
+        y = a * x + b * sqrtL * xi
+        lp_y = log_posterior(y)
+        if torch.rand(()) < math.exp(min(0.0, lp_y - lp)):
+            x, lp = y, lp_y
+            acc += 1
+        samples.append(x.cpu().numpy())
+        if i > 0 and i % 50 == 0:
+            ar = acc / i
+            logb += 0.1 / math.sqrt(i/50) * (ar - 0.23)
+            logb = np.clip(logb, logb_min, logb_max)
+    return np.array(samples), acc/N, time.time()-t0
+
+def smooth_w(t, t0, s=0.2):
+    return 1.0 / (1.0 + math.exp(-(t - t0)/(s*t0 + 1e-6)))
+
+def pcn_dual(x0, beta0, N, t_switch, dim):
+    x = x0.clone().flatten()
+    logb = math.log(beta0)
+    scale = 1.0 / math.sqrt(dim)
+    logb_min, logb_max = math.log(0.01*scale), math.log(0.8*scale)
+    samples, acc = [], 0
+    t0 = time.time()
+    lp = log_posterior(x)
+    for i in range(N):
+        b = math.exp(logb)
+        a = math.sqrt(max(1.0 - b**2, 1e-6))
+        xi = torch.randn_like(x)
+        y = a * x + b * sqrtL * xi
+        lp_y = log_posterior(y)
+        if torch.rand(()) < math.exp(min(0.0, lp_y - lp)):
+            x, lp = y, lp_y
+            acc += 1
+        samples.append(x.cpu().numpy())
+        if i > 0 and i % 50 == 0:
+            ar = acc / i
+            w = smooth_w(i, t_switch)
+            g_acc = ar - 0.23
+            g_ess = 0.0
+            if i > 500:
+                blk = np.array(samples[-500:])
+                g_ess = np.clip(ess_mean(blk)/500 - 0.5, -1.0, 1.0)
+            logb += 0.1 / math.sqrt(i/50) * ((1-w)*g_acc + w*g_ess)
+            logb = np.clip(logb, logb_min, logb_max)
+    return np.array(samples), acc/N, time.time()-t0
+
+# ------------------------------------------------------------------------------
+# 主运行：三个算法对比
+# ------------------------------------------------------------------------------
+if __name__ == '__main__':
+    dim = 2
+    x0 = torch.tensor(prior_mean, device=DEVICE)
+    N = 6000
+    burn = 1500
+    init_beta = 0.5 / math.sqrt(dim)
+
+    print("="*60)
+    print("   CQNLSE 三次-五次非线性反问题 — 三算法对比")
+    print("="*60)
+
+    s_van, ar_van, t_van = pcn_vanilla(x0, init_beta, N)
+    s_adp, ar_adp, t_adp = pcn_adap_ess(x0, init_beta, N, dim)
+    s_dua, ar_dua, t_dua = pcn_dual(x0, init_beta, N, 2000, dim)
+
+    # 结果汇总
+    res = []
+    samples_list = [s_van, s_adp, s_dua]
+    ar_list = [ar_van, ar_adp, ar_dua]
+    t_list = [t_van, t_adp, t_dua]
+
+    for name, s, ar, t, c in zip(labels, samples_list, ar_list, t_list, colors):
+        post = s[burn:]
+        ess = ess_mean(post)
+        a_est = post[:,0].mean()
+        b_est = post[:,1].mean()
+        err_a = abs(a_est - alpha_true)
+        err_b = abs(b_est - beta_true)
+        res.append([
+            name, f"{ar:.3f}", f"{ess:.1f}", f"{t:.2f}",
+            f"{a_est:.4f}", f"{err_a:.4f}", f"{b_est:.4f}", f"{err_b:.4f}"
+        ])
+
+    # 打印对比表
+    print("\n算法性能与反演精度对比")
+    print(tabulate(res, headers=[
+        "Method", "Acc", "ESS(mean)", "Time(s)",
+        "α_est", "|α_err|", "β_est", "|β_err|"
+    ], tablefmt="grid"))
+
+    # 反演结果汇总
+    post_adap = s_adp[burn:]
+    a_m, a_s = post_adap[:,0].mean(), post_adap[:,0].std()
+    b_m, b_s = post_adap[:,1].mean(), post_adap[:,1].std()
+
+    print("\nAdap-ESS pCN 最终反演结果")
+    print(tabulate([
+        ["α", alpha_true, a_m, a_s, a_m - alpha_true],
+        ["β", beta_true,  b_m, b_s, b_m - beta_true]
+    ], headers=["Param", "True", "Mean", "Std", "Error"], tablefmt="grid"))
+
+    # --------------------------------------------------------------------------
+    # 图1：后验分布对比
+    # --------------------------------------------------------------------------
+    plt.figure(figsize=(7,6))
+    for i, s in enumerate(samples_list):
+        post = s[burn:]
+        plt.scatter(post[:,0], post[:,1], s=4, alpha=0.2, color=colors[i], label=labels[i])
+    plt.scatter(alpha_true, beta_true, c='k', s=150, marker='*', label='True')
+    plt.xlabel(r'$\alpha$ (cubic nonlinearity)')
+    plt.ylabel(r'$\beta$ (quintic nonlinearity)')
+    plt.title('Posterior Distribution of CQNLSE Inverse Problem')
+    plt.legend(loc='upper right', frameon=True)
+    plt.tight_layout()
+    plt.savefig("cqnlse_posterior_compare.png", bbox_inches='tight')
+    plt.close()
+
+    # --------------------------------------------------------------------------
+    # 图2：参数轨迹图 (Adap-ESS)
+    # --------------------------------------------------------------------------
+    fig, (ax1, ax2) = plt.subplots(2,1,figsize=(8,5),sharex=True)
+    ax1.plot(post_adap[:,0], color=colors[1], linewidth=0.6)
+    ax1.axhline(alpha_true, c='k', linestyle='--', linewidth=1.0)
+    ax1.set_ylabel(r'$\alpha$')
+    ax1.set_title('Trace Plot (Adap-ESS pCN)')
+
+    ax2.plot(post_adap[:,1], color=colors[1], linewidth=0.6)
+    ax2.axhline(beta_true, c='k', linestyle='--', linewidth=1.0)
+    ax2.set_ylabel(r'$\beta$')
+    ax2.set_xlabel('Iteration')
+    plt.tight_layout()
+    plt.savefig("cqnlse_trace.png", bbox_inches='tight')
+    plt.close()
+
+    # --------------------------------------------------------------------------
+    # 保存数据
+    # --------------------------------------------------------------------------
+    np.savez("cqnlse_inversion_results.npz",
+             alpha_true=alpha_true, beta_true=beta_true,
+             samples_vanilla=s_van[burn:],
+             samples_adap=s_adp[burn:],
+             samples_dual=s_dua[burn:])
+
+    print("\n✅ 图片与数据已保存完成")
