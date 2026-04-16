@@ -7,26 +7,37 @@ import matplotlib.pyplot as plt
 from tabulate import tabulate
 
 # ------------------------------------------------------------------------------
-# Science 风格绘图设置（顶级期刊标准）
+# 🔥 论文原版绘图风格（完全和你之前保持一致）
 # ------------------------------------------------------------------------------
 plt.rcParams.update({
-    "font.family": "serif",
-    "font.size": 11,
-    "axes.linewidth": 0.8,
-    "axes.labelsize": 11,
-    "xtick.labelsize": 10,
-    "ytick.labelsize": 10,
-    "legend.fontsize": 9,
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
+    "font.size": 9,
+    "axes.titlesize": 10,
+    "axes.labelsize": 9,
+    "legend.fontsize": 8,
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+    "axes.linewidth": 0.6,
+    "grid.linewidth": 0.4,
+    "lines.linewidth": 1.2,
     "figure.dpi": 300,
-    "savefig.dpi": 600,
-    "axes.grid": True,
-    "grid.alpha": 0.2,
-    "axes.spines.top": False,
-    "axes.spines.right": False,
+    "savefig.dpi": 400,
+    "savefig.transparent": False,
+    "figure.constrained_layout.use": True
 })
 
-colors = ["#1f77b4", "#d62728", "#2ca02c"]
-labels = ["Vanilla pCN", "Adap-ESS pCN", "Dual-signal pCN"]
+METHODS = ["Vanilla pCN", "Adap-ESS pCN", "Dual-signal pCN"]
+METHOD_COLORS = {
+    "Vanilla pCN": "#4D4D4D",
+    "Adap-ESS pCN": "#D62728",
+    "Dual-signal pCN": "#009E73",
+}
+MARKERS = {"Vanilla pCN": "o", "Adap-ESS pCN": "s", "Dual-signal pCN": "^"}
+LINESTYLES = {"Vanilla pCN": "-", "Adap-ESS pCN": "--", "Dual-signal pCN": "-."}
+
+colors = [METHOD_COLORS[m] for m in METHODS]
+labels = METHODS
 
 # ------------------------------------------------------------------------------
 # 全局配置
@@ -180,6 +191,19 @@ def pcn_dual(x0, beta0, N, t_switch, dim):
     return np.array(samples), acc/N, time.time()-t0
 
 # ------------------------------------------------------------------------------
+# 🔥 论文同款美化函数
+# ------------------------------------------------------------------------------
+def beautify_ax(ax):
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(True, linestyle="--", alpha=0.3)
+    ax.tick_params(direction='out', length=3, width=0.6)
+
+def add_panel_label(ax, label):
+    ax.text(-0.15, 1.1, f"({label})", transform=ax.transAxes,
+            fontsize=11, fontweight="bold", va="top", ha="right")
+
+# ------------------------------------------------------------------------------
 # 主运行：三个算法对比
 # ------------------------------------------------------------------------------
 if __name__ == '__main__':
@@ -234,36 +258,41 @@ if __name__ == '__main__':
     ], headers=["Param", "True", "Mean", "Std", "Error"], tablefmt="grid"))
 
     # --------------------------------------------------------------------------
-    # 图1：后验分布对比
+    # 🔥 图1：后验分布对比（论文风格）
     # --------------------------------------------------------------------------
     plt.figure(figsize=(7,6))
+    ax = plt.gca()
     for i, s in enumerate(samples_list):
         post = s[burn:]
-        plt.scatter(post[:,0], post[:,1], s=4, alpha=0.2, color=colors[i], label=labels[i])
-    plt.scatter(alpha_true, beta_true, c='k', s=150, marker='*', label='True')
+        plt.scatter(post[:,0], post[:,1], s=4, alpha=0.3, color=colors[i], label=labels[i])
+    plt.scatter(alpha_true, beta_true, c='black', s=160, marker='*', label='True value', zorder=5)
     plt.xlabel(r'$\alpha$ (cubic nonlinearity)')
     plt.ylabel(r'$\beta$ (quintic nonlinearity)')
-    plt.title('Posterior Distribution of CQNLSE Inverse Problem')
-    plt.legend(loc='upper right', frameon=True)
-    plt.tight_layout()
+    beautify_ax(ax)
+    plt.legend(loc='upper right', frameon=False)
     plt.savefig("cqnlse_posterior_compare.png", bbox_inches='tight')
+    plt.savefig("cqnlse_posterior_compare.pdf", bbox_inches='tight')
     plt.close()
 
     # --------------------------------------------------------------------------
-    # 图2：参数轨迹图 (Adap-ESS)
+    # 🔥 图2：参数轨迹图 (论文风格)
     # --------------------------------------------------------------------------
     fig, (ax1, ax2) = plt.subplots(2,1,figsize=(8,5),sharex=True)
-    ax1.plot(post_adap[:,0], color=colors[1], linewidth=0.6)
-    ax1.axhline(alpha_true, c='k', linestyle='--', linewidth=1.0)
+    ax1.plot(post_adap[:,0], color=colors[1], linewidth=0.7)
+    ax1.axhline(alpha_true, c='black', linestyle='--', linewidth=1.0)
     ax1.set_ylabel(r'$\alpha$')
-    ax1.set_title('Trace Plot (Adap-ESS pCN)')
+    beautify_ax(ax1)
+    add_panel_label(ax1, 'a')
 
-    ax2.plot(post_adap[:,1], color=colors[1], linewidth=0.6)
-    ax2.axhline(beta_true, c='k', linestyle='--', linewidth=1.0)
+    ax2.plot(post_adap[:,1], color=colors[1], linewidth=0.7)
+    ax2.axhline(beta_true, c='black', linestyle='--', linewidth=1.0)
     ax2.set_ylabel(r'$\beta$')
     ax2.set_xlabel('Iteration')
-    plt.tight_layout()
+    beautify_ax(ax2)
+    add_panel_label(ax2, 'b')
+
     plt.savefig("cqnlse_trace.png", bbox_inches='tight')
+    plt.savefig("cqnlse_trace.pdf", bbox_inches='tight')
     plt.close()
 
     # --------------------------------------------------------------------------
