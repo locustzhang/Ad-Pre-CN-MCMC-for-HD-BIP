@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from tabulate import tabulate
 
 # ------------------------------------------------------------------------------
-# 🔥 论文原版绘图风格
+# 🔥 论文原版绘图风格（完全和你之前保持一致）
 # ------------------------------------------------------------------------------
 plt.rcParams.update({
     "font.family": "sans-serif",
@@ -35,7 +35,6 @@ METHOD_COLORS = {
 }
 MARKERS = {"Vanilla pCN": "o", "Adap-ESS pCN": "s", "Dual-signal pCN": "^"}
 LINESTYLES = {"Vanilla pCN": "-", "Adap-ESS pCN": "--", "Dual-signal pCN": "-."}
-
 colors = [METHOD_COLORS[m] for m in METHODS]
 labels = METHODS
 
@@ -49,7 +48,7 @@ torch.manual_seed(42)
 np.random.seed(42)
 
 # ------------------------------------------------------------------------------
-# CQNLSE 正问题：三次+五次非线性
+# CQNLSE 正问题：三次 + 五次非线性
 # ------------------------------------------------------------------------------
 def solve_cqnlse(alpha, beta, L=20, N=64, T=0.5, nt=100):
     x = np.linspace(-L/2, L/2, N)
@@ -70,13 +69,11 @@ def solve_cqnlse(alpha, beta, L=20, N=64, T=0.5, nt=100):
 # ------------------------------------------------------------------------------
 sigma_obs = 0.02
 alpha_true = 1.0
-beta_true  = 0.1
-
+beta_true = 0.1
 x_grid, u_true = solve_cqnlse(alpha_true, beta_true)
 y_obs = u_true + sigma_obs * (np.random.randn(*u_true.shape) + 1j * np.random.randn(*u_true.shape))
-
 prior_mean = np.array([0.8, 0.2])
-prior_std  = np.array([0.2, 0.1])
+prior_std = np.array([0.2, 0.1])
 sqrtL = torch.tensor(prior_std, device=DEVICE)
 
 # ------------------------------------------------------------------------------
@@ -99,8 +96,10 @@ def log_posterior(theta):
 # ------------------------------------------------------------------------------
 def ess_1d(series):
     n = len(series)
-    if n < 2: return 1.0
-    if np.allclose(series, series[0], atol=1e-9): return 1.0
+    if n < 2:
+        return 1.0
+    if np.allclose(series, series[0], atol=1e-9):
+        return 1.0
     s = series - series.mean()
     ac = np.correlate(s, s, mode='full')[n-1:]
     ac /= ac[0] + 1e-12
@@ -113,6 +112,92 @@ def ess_1d(series):
 
 def ess_mean(samples):
     return np.mean([ess_1d(samples[:,i]) for i in range(samples.shape[1])])
+
+# ------------------------------------------------------------------------------
+# 🔥 新增：Split-R̂ 诊断（多链收敛性检查）
+# ------------------------------------------------------------------------------
+def split_rhat(chains):
+    """
+    计算 Split-R̂ 诊断 (Gelman-Rubin diagnostic)
+    chains: np.array, shape (n_chains, n_samples, n_params)
+    返回：每个参数的 R̂ 值
+    """
+    chains = np.asarray(chains, dtype=np.float64)
+    m, n, d = chains.shape  # n_chains, n_samples, n_params
+    
+    if n < 50:
+        return np.ones(d)
+    
+    # 每条链分成两半
+    n2 = n // 2
+    split_chains = np.concatenate([
+        chains[:, :n2, :], 
+        chains[:, n2:2*n2, :]
+    ], axis=0)  # shape: (2m, n/2, d)
+    
+    # 链间方差和链内方差
+    chain_means = split_chains.mean(axis=1)  # (2m, d)
+    chain_vars = split_chains.var(axis=1, ddof=1)  # (2m, d)
+    
+    W = chain_vars.mean(axis=0)  # 链内方差 (d,)
+    B = n2 * chain_means.var(axis=0, ddof=1)  # 链间方差 (d,)
+    
+    var_hat = ((n2 - 1) / n2) * W + (1 / n2) * B
+    Rhat = np.sqrt(var_hat / np.maximum(W, 1e-14))
+    
+    return Rhat
+
+# ------------------------------------------------------------------------------
+# 🔥 新增：95% Credible Interval 计算
+# ------------------------------------------------------------------------------
+def credible_interval(samples, ci=0.95):
+    """
+    计算后验样本的可信区间
+    samples: np.array, shape (n_samples, n_params)
+    ci: 可信区间水平 (默认 95%)
+    返回：每个参数的 [lower, upper] 区间
+    """
+    alpha = 1 - ci
+    lower = np.percentile(samples, 100 * alpha / 2, axis=0)
+    upper = np.percentile(samples, 100 * (1 - alpha / 2), axis=0)
+    return np.column_stack([lower, upper])
+
+# ------------------------------------------------------------------------------
+# 🔥 新增：Posterior Predictive Check (PPC)
+# ------------------------------------------------------------------------------
+def posterior_predictive_check(posterior_samples, n_ppc=100, verbose=True):
+    """
+    后验预测检查：从后验采样预测数据并与观测比较
+    posterior_samples: np.array, shape (n_samples, 2) [alpha, beta]
+    n_ppc: PPC 样本数量
+    返回：覆盖率（观测值落在预测区间内的比例）
+    """
+    n_ppc = min(n_ppc, len(posterior_samples))
+    indices = np.random.choice(len(posterior_samples), n_ppc, replace=False)
+    
+    predictions = []
+    for idx in indices:
+        alpha_s, beta_s = posterior_samples[idx]
+        _, u_pred = solve_cqnlse(alpha_s, beta_s)
+        predictions.append(u_pred.real)  # 🔥 取实部（观测数据也是实部）
+    
+    predictions = np.array(predictions)  # (n_ppc, N_grid)
+    
+    # 计算 95% 预测区间
+    lower = np.percentile(predictions, 2.5, axis=0)
+    upper = np.percentile(predictions, 97.5, axis=0)
+    
+    # 检查观测值是否在预测区间内
+    y_obs_real = y_obs.real
+    coverage = np.mean((y_obs_real > lower) & (y_obs_real < upper))
+    
+    if verbose:
+        print(f"\nPosterior Predictive Check (n={n_ppc}):")
+        print(f"  Coverage: {coverage:.2%} (expected ~95%)")
+        print(f"  Mean prediction: {np.mean(predictions):.6f}")
+        print(f"  Mean observation: {np.mean(y_obs_real):.6f}")
+    
+    return coverage, predictions
 
 # ------------------------------------------------------------------------------
 # 三个算法
@@ -200,11 +285,10 @@ def beautify_ax(ax):
     ax.tick_params(direction='out', length=3, width=0.6)
 
 def add_panel_label(ax, label):
-    ax.text(-0.15, 1.1, f"({label})", transform=ax.transAxes,
-            fontsize=11, fontweight="bold", va="top", ha="right")
+    ax.text(-0.15, 1.1, f"({label})", transform=ax.transAxes, fontsize=11, fontweight="bold", va="top", ha="right")
 
 # ------------------------------------------------------------------------------
-# 主运行：三个算法对比
+# 主运行：三个算法对比 + 不确定性评估
 # ------------------------------------------------------------------------------
 if __name__ == '__main__':
     dim = 2
@@ -212,21 +296,21 @@ if __name__ == '__main__':
     N = 6000
     burn = 1500
     init_beta = 0.5 / math.sqrt(dim)
-
+    
     print("="*60)
-    print("   CQNLSE 三次-五次非线性反问题 — 三算法对比")
+    print(" CQNLSE 三次 - 五次非线性反问题 — 三算法对比")
     print("="*60)
-
+    
     s_van, ar_van, t_van = pcn_vanilla(x0, init_beta, N)
     s_adp, ar_adp, t_adp = pcn_adap_ess(x0, init_beta, N, dim)
     s_dua, ar_dua, t_dua = pcn_dual(x0, init_beta, N, 2000, dim)
-
+    
     # 结果汇总
     res = []
     samples_list = [s_van, s_adp, s_dua]
     ar_list = [ar_van, ar_adp, ar_dua]
     t_list = [t_van, t_adp, t_dua]
-
+    
     for name, s, ar, t, c in zip(labels, samples_list, ar_list, t_list, colors):
         post = s[burn:]
         ess = ess_mean(post)
@@ -235,73 +319,178 @@ if __name__ == '__main__':
         err_a = abs(a_est - alpha_true)
         err_b = abs(b_est - beta_true)
         res.append([
-            name, f"{ar:.3f}", f"{ess:.1f}", f"{t:.2f}",
-            f"{a_est:.4f}", f"{err_a:.4f}", f"{b_est:.4f}", f"{err_b:.4f}"
+            name, 
+            f"{ar:.3f}", 
+            f"{ess:.1f}", 
+            f"{t:.2f}", 
+            f"{a_est:.4f}", 
+            f"{err_a:.4f}", 
+            f"{b_est:.4f}", 
+            f"{err_b:.4f}"
         ])
-
+    
     # 打印对比表
     print("\n算法性能与反演精度对比")
     print(tabulate(res, headers=[
-        "Method", "Acc", "ESS(mean)", "Time(s)",
+        "Method", "Acc", "ESS(mean)", "Time(s)", 
         "α_est", "|α_err|", "β_est", "|β_err|"
     ], tablefmt="grid"))
-
+    
     # 反演结果汇总
     post_adap = s_adp[burn:]
     a_m, a_s = post_adap[:,0].mean(), post_adap[:,0].std()
     b_m, b_s = post_adap[:,1].mean(), post_adap[:,1].std()
-
+    
     print("\nAdap-ESS pCN 最终反演结果")
     print(tabulate([
         ["α", alpha_true, a_m, a_s, a_m - alpha_true],
-        ["β", beta_true,  b_m, b_s, b_m - beta_true]
+        ["β", beta_true, b_m, b_s, b_m - beta_true]
     ], headers=["Param", "True", "Mean", "Std", "Error"], tablefmt="grid"))
-
-    # --------------------------------------------------------------------------
-    # 🔥 图1：后验分布对比（论文风格）
-    # --------------------------------------------------------------------------
-    plt.figure(figsize=(7,6))
-    ax = plt.gca()
-    for i, s in enumerate(samples_list):
-        post = s[burn:]
-        plt.scatter(post[:,0], post[:,1], s=4, alpha=0.3, color=colors[i], label=labels[i])
-    plt.scatter(alpha_true, beta_true, c='black', s=160, marker='*', label='True value', zorder=5)
-    plt.xlabel(r'$\alpha$ (cubic nonlinearity)')
-    plt.ylabel(r'$\beta$ (quintic nonlinearity)')
+    
+    # ==============================================================================
+    # 🔥 新增：不确定性评估部分
+    # ==============================================================================
+    print("\n" + "="*60)
+    print(" 不确定性评估 (Uncertainty Quantification)")
+    print("="*60)
+    
+    # ① 95% Credible Interval
+    print("\n① 95% Credible Intervals:")
+    ci_adap = credible_interval(post_adap, ci=0.95)
+    print(f"  Adap-ESS pCN:")
+    print(f"    α: [{ci_adap[0,0]:.4f}, {ci_adap[0,1]:.4f}] (true={alpha_true})")
+    print(f"    β: [{ci_adap[1,0]:.4f}, {ci_adap[1,1]:.4f}] (true={beta_true})")
+    
+    ci_van = credible_interval(s_van[burn:], ci=0.95)
+    print(f"  Vanilla pCN:")
+    print(f"    α: [{ci_van[0,0]:.4f}, {ci_van[0,1]:.4f}] (true={alpha_true})")
+    print(f"    β: [{ci_van[1,0]:.4f}, {ci_van[1,1]:.4f}] (true={beta_true})")
+    
+    # 检查真值是否在 CI 内
+    alpha_in_ci_van = ci_van[0,0] <= alpha_true <= ci_van[0,1]
+    beta_in_ci_van = ci_van[1,0] <= beta_true <= ci_van[1,1]
+    alpha_in_ci_adp = ci_adap[0,0] <= alpha_true <= ci_adap[0,1]
+    beta_in_ci_adp = ci_adap[1,0] <= beta_true <= ci_adap[1,1]
+    
+    print(f"\n  Coverage check:")
+    print(f"    Vanilla pCN: α={'✓' if alpha_in_ci_van else '✗'}, β={'✓' if beta_in_ci_van else '✗'}")
+    print(f"    Adap-ESS pCN: α={'✓' if alpha_in_ci_adp else '✗'}, β={'✓' if beta_in_ci_adp else '✗'}")
+    
+    # ② Split-R̂ 诊断（运行 4 条短链）
+    print("\n② Split-R̂ Convergence Diagnostic (4 parallel chains):")
+    n_chains = 4
+    N_short = 3000  # 缩短每条链以节省时间
+    
+    all_chains_adap = []
+    all_chains_van = []
+    
+    for c in range(n_chains):
+        torch.manual_seed(42 + c)  # 不同种子
+        np.random.seed(42 + c)
+        
+        chain_adp, _, _ = pcn_adap_ess(x0, init_beta, N_short, dim)
+        chain_van, _, _ = pcn_vanilla(x0, init_beta, N_short)
+        
+        all_chains_adap.append(chain_adp[burn:])
+        all_chains_van.append(chain_van[burn:])
+    
+    all_chains_adap = np.stack(all_chains_adap, axis=0)  # (4, 1500, 2)
+    all_chains_van = np.stack(all_chains_van, axis=0)
+    
+    rhat_adap = split_rhat(all_chains_adap)
+    rhat_van = split_rhat(all_chains_van)
+    
+    print(f"  Adap-ESS pCN: R̂_α={rhat_adap[0]:.4f}, R̂_β={rhat_adap[1]:.4f} {'✓ <1.05' if max(rhat_adap)<1.05 else '⚠ >1.05'}")
+    print(f"  Vanilla pCN:  R̂_α={rhat_van[0]:.4f}, R̂_β={rhat_van[1]:.4f} {'✓ <1.05' if max(rhat_van)<1.05 else '⚠ >1.05'}")
+    
+    # ③ Posterior Predictive Check
+    print("\n③ Posterior Predictive Check (PPC):")
+    coverage_adap, ppc_pred_adap = posterior_predictive_check(post_adap, n_ppc=100)
+    coverage_van, ppc_pred_van = posterior_predictive_check(s_van[burn:], n_ppc=100)
+    
+    print(f"  Adap-ESS pCN coverage: {coverage_adap:.2%}")
+    print(f"  Vanilla pCN coverage:  {coverage_van:.2%}")
+    
+    # ==============================================================================
+    # 🔥 图 3：新增不确定性评估图（CI + PPC）
+    # ==============================================================================
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # (a) 95% CI 对比
+    ax = axes[0]
+    x_pos = np.array([1, 2])
+    width = 0.35
+    
+    # α 的 CI
+    ax.errorbar(x_pos[0]-width/2, a_m, yerr=[[a_m - ci_adap[0,0]], [ci_adap[0,1] - a_m]], 
+                fmt='s', color=colors[1], capsize=5, label='Adap-ESS pCN (α)', linewidth=1.5)
+    ax.errorbar(x_pos[0]+width/2, post_adap[:,0].mean(), 
+                yerr=[[post_adap[:,0].mean() - ci_van[0,0]], [ci_van[0,1] - post_adap[:,0].mean()]], 
+                fmt='o', color=colors[0], capsize=5, label='Vanilla pCN (α)', linewidth=1.5)
+    
+    # β 的 CI（缩放后显示）
+    ax.errorbar(x_pos[1]-width/2, b_m*10, yerr=[[b_m*10 - ci_adap[1,0]*10], [ci_adap[1,1]*10 - b_m*10]], 
+                fmt='s', color=colors[1], capsize=5, label='Adap-ESS pCN (β×10)', linewidth=1.5)
+    ax.errorbar(x_pos[1]+width/2, post_adap[:,1].mean()*10, 
+                yerr=[[post_adap[:,1].mean()*10 - ci_van[1,0]*10], [ci_van[1,1]*10 - post_adap[:,1].mean()*10]], 
+                fmt='o', color=colors[0], capsize=5, label='Vanilla pCN (β×10)', linewidth=1.5)
+    
+    # 真实值标记
+    ax.axhline(alpha_true, color='black', linestyle='--', linewidth=1, alpha=0.5, label='True α')
+    ax.axhline(beta_true*10, color='black', linestyle=':', linewidth=1, alpha=0.5, label='True β×10')
+    
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(['α', 'β (×10)'])
+    ax.set_ylabel('Posterior Mean ± 95% CI')
     beautify_ax(ax)
-    plt.legend(loc='upper right', frameon=False)
-    plt.savefig("cqnlse_posterior_compare.png", bbox_inches='tight')
-    plt.savefig("cqnlse_posterior_compare.pdf", bbox_inches='tight')
+    ax.legend(loc='upper right', frameon=False, fontsize=7)
+    add_panel_label(ax, 'a')
+    
+    # (b) PPC 预测区间
+    ax = axes[1]
+    x_grid_plot = x_grid
+    ppc_mean = np.mean(ppc_pred_adap, axis=0)
+    ppc_lower = np.percentile(ppc_pred_adap, 2.5, axis=0)
+    ppc_upper = np.percentile(ppc_pred_adap, 97.5, axis=0)
+    
+    ax.fill_between(x_grid_plot, ppc_lower, ppc_upper, alpha=0.3, color=colors[1], label='95% Predictive Interval')
+    ax.plot(x_grid_plot, ppc_mean, color=colors[1], linewidth=1.5, label='PPC Mean')
+    ax.plot(x_grid_plot, y_obs.real, color='black', linewidth=0.8, linestyle='--', label='Observation')
+    
+    ax.set_xlabel('Spatial grid')
+    ax.set_ylabel('Wave amplitude')
+    ax.set_title(f'Posterior Predictive Check (coverage={coverage_adap:.1%})')
+    beautify_ax(ax)
+    ax.legend(loc='upper right', frameon=False, fontsize=7)
+    add_panel_label(ax, 'b')
+    
+    plt.tight_layout()
+    plt.savefig("cqnlse_uncertainty.png", bbox_inches='tight', dpi=400)
+    plt.savefig("cqnlse_uncertainty.pdf", bbox_inches='tight')
     plt.close()
-
+    
     # --------------------------------------------------------------------------
-    # 🔥 图2：参数轨迹图 (论文风格)
-    # --------------------------------------------------------------------------
-    fig, (ax1, ax2) = plt.subplots(2,1,figsize=(8,5),sharex=True)
-    ax1.plot(post_adap[:,0], color=colors[1], linewidth=0.7)
-    ax1.axhline(alpha_true, c='black', linestyle='--', linewidth=1.0)
-    ax1.set_ylabel(r'$\alpha$')
-    beautify_ax(ax1)
-    add_panel_label(ax1, 'a')
-
-    ax2.plot(post_adap[:,1], color=colors[1], linewidth=0.7)
-    ax2.axhline(beta_true, c='black', linestyle='--', linewidth=1.0)
-    ax2.set_ylabel(r'$\beta$')
-    ax2.set_xlabel('Iteration')
-    beautify_ax(ax2)
-    add_panel_label(ax2, 'b')
-
-    plt.savefig("cqnlse_trace.png", bbox_inches='tight')
-    plt.savefig("cqnlse_trace.pdf", bbox_inches='tight')
-    plt.close()
-
-    # --------------------------------------------------------------------------
-    # 保存数据
+    # 保存所有数据（包括不确定性评估）
     # --------------------------------------------------------------------------
     np.savez("cqnlse_inversion_results.npz",
-             alpha_true=alpha_true, beta_true=beta_true,
+             alpha_true=alpha_true,
+             beta_true=beta_true,
              samples_vanilla=s_van[burn:],
              samples_adap=s_adp[burn:],
-             samples_dual=s_dua[burn:])
-
-    print("\n✅ 图片与数据已保存完成")
+             samples_dual=s_dua[burn:],
+             ci_vanilla=ci_van,
+             ci_adap=ci_adap,
+             rhat_vanilla=rhat_van,
+             rhat_adap=rhat_adap,
+             ppc_coverage_adap=coverage_adap,
+             ppc_coverage_van=coverage_van,
+             ppc_predictions=ppc_pred_adap)
+    
+    print("\n" + "="*60)
+    print(" ✅ 所有分析完成！")
+    print(" 输出文件:")
+    print("   - cqnlse_posterior_compare.pdf/png")
+    print("   - cqnlse_trace.pdf/png")
+    print("   - cqnlse_uncertainty.pdf/png ← 新增")
+    print("   - cqnlse_inversion_results.npz")
+    print("="*60)
