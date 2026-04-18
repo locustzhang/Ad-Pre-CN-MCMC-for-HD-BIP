@@ -8,8 +8,8 @@ ULTIMATE REVIEWER-PROOF PAPER SCRIPT (FIGURE 1–5 LAYOUT) — FINAL MERGED VERS
 
 Algorithms:
   (1) Vanilla pCN
-  (2) Adaptive-ESS pCN
-  (3) Dual-signal pCN
+  (2) Acceptance-Rate Adaptive pCN
+  (3) Dual-Signal pCN
 
 Experiments (5 total):
   Exp0: BaselineScan (dim=10..100)
@@ -115,17 +115,26 @@ plt.rcParams.update({
     "savefig.bbox": "tight",
 })
 
-METHODS = ["Vanilla pCN", "Adap-ESS pCN", "Dual-signal pCN"]
+METHODS = ["Vanilla pCN", "Acceptance-Rate Adaptive pCN", "Dual-Signal pCN"]
 
 # Muted academic palette (high quality in print)
 METHOD_COLORS = {
-    "Vanilla pCN": "#4D4D4D",     # muted gray
-    "Adap-ESS pCN": "#B2182B",    # deep academic red
-    "Dual-signal pCN": "#1A9850", # deep green
+    "Vanilla pCN": "#4D4D4D",                    # muted gray
+    "Acceptance-Rate Adaptive pCN": "#B2182B",   # deep academic red
+    "Dual-Signal pCN": "#1A9850",                # deep green
 }
 
-MARKERS = {"Vanilla pCN": "o", "Adap-ESS pCN": "s", "Dual-signal pCN": "^"}
-LINESTYLES = {"Vanilla pCN": "-", "Adap-ESS pCN": "--", "Dual-signal pCN": "-."}
+MARKERS = {
+    "Vanilla pCN": "o", 
+    "Acceptance-Rate Adaptive pCN": "s", 
+    "Dual-Signal pCN": "^"
+}
+
+LINESTYLES = {
+    "Vanilla pCN": "-", 
+    "Acceptance-Rate Adaptive pCN": "--", 
+    "Dual-Signal pCN": "-."
+}
 
 
 def beautify_ax(ax, grid=True):
@@ -340,7 +349,6 @@ def pcn_adap_ess(x0, invL, sqrtL, AtA, Aty, sigma, beta0, N, dim, adapt_stop):
 
         samples[i] = x.detach().cpu().numpy()
 
-        # FIXED: ar must be acc/(i+1)
         if i < adapt_stop and i > 0 and i % 200 == 0:
             ar = acc / (i + 1)
             gamma = 0.12 / math.sqrt(i / 200.0 + 1.0)
@@ -394,7 +402,6 @@ def pcn_dual(x0, invL, sqrtL, AtA, Aty, sigma, beta0, N, t_switch, dim, adapt_st
             g_acc = ar - 0.234
             g_ess = 0.0
 
-            # ESS feedback only after enough samples
             if i > 2500:
                 blk = samples[i-2000:i]
                 g_ess = np.clip((ess_mean(blk) / 2000.0) - 0.5, -1.0, 1.0)
@@ -905,7 +912,7 @@ def run_experiment(exp_name, dim_list, n_chains=4, eval_budget=20000):
                 if method == "Vanilla pCN":
                     s, ar, t = pcn_vanilla(x_init, invL, sqrtL, AtA, Aty, sigma, init_beta, N)
 
-                elif method == "Adap-ESS pCN":
+                elif method == "Acceptance-Rate Adaptive pCN":
                     s, ar, t = pcn_adap_ess(x_init, invL, sqrtL, AtA, Aty, sigma, init_beta, N, dim, adapt_stop)
 
                 else:
