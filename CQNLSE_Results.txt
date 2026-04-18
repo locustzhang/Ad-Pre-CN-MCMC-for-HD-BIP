@@ -6,11 +6,11 @@
 +-----------------+-------+-------------+-----------+---------+-----------+---------+-----------+
 | Method          |   Acc |   ESS(mean) |   Time(s) |   α_est |   |α_err| |   β_est |   |β_err| |
 +=================+=======+=============+===========+=========+===========+=========+===========+
-| Vanilla pCN     | 0.029 |        14   |     21.08 |  0.9764 |    0.0236 |  0.1119 |    0.0119 |
+| Vanilla pCN     | 0.029 |        14   |     21.3  |  0.9764 |    0.0236 |  0.1119 |    0.0119 |
 +-----------------+-------+-------------+-----------+---------+-----------+---------+-----------+
-| Adap-ESS pCN    | 0.049 |        74.1 |     21.07 |  0.9871 |    0.0129 |  0.1072 |    0.0072 |
+| Adap-ESS pCN    | 0.049 |        74.1 |     21.72 |  0.9871 |    0.0129 |  0.1072 |    0.0072 |
 +-----------------+-------+-------------+-----------+---------+-----------+---------+-----------+
-| Dual-signal pCN | 0.058 |        58.3 |     21.11 |  0.9861 |    0.0139 |  0.1076 |    0.0076 |
+| Dual-signal pCN | 0.058 |        58.3 |     21.89 |  0.9861 |    0.0139 |  0.1076 |    0.0076 |
 +-----------------+-------+-------------+-----------+---------+-----------+---------+-----------+
 
 Adap-ESS pCN 最终反演结果
@@ -26,43 +26,48 @@ Adap-ESS pCN 最终反演结果
  不确定性评估 (Uncertainty Quantification)
 ============================================================
 
-① 95% Credible Intervals:
-  Adap-ESS pCN:
-    α: [0.9256, 1.0460] (true=1.0)
-    β: [0.0807, 0.1347] (true=0.1)
-  Vanilla pCN:
+  Vanilla pCN 95% Credible Interval:
     α: [0.8933, 1.0413] (true=1.0)
     β: [0.0828, 0.1496] (true=0.1)
-
-  Coverage check:
-    Vanilla pCN: α=✓, β=✓
-    Adap-ESS pCN: α=✓, β=✓
-
-② Split-R̂ Convergence Diagnostic (4 parallel chains):
-  Adap-ESS pCN: R̂_α=1.1373, R̂_β=1.1338 ⚠ >1.05
-  Vanilla pCN:  R̂_α=1.0696, R̂_β=1.0679 ⚠ >1.05
-
-③ Posterior Predictive Check (PPC):
-
-Posterior Predictive Check (n=100):
-  Coverage: 7.81% (expected ~95%)
-  Mean prediction: 0.171814
-  Mean observation: 0.168291
+    Coverage check: α=✓, β=✓
 
 Posterior Predictive Check (n=100):
   Coverage: 9.38% (expected ~95%)
+  Mean prediction: 0.171996
+  Mean observation: 0.168291
+    PPC coverage: 9.38%
+
+  Adap-ESS pCN 95% Credible Interval:
+    α: [0.9256, 1.0460] (true=1.0)
+    β: [0.0807, 0.1347] (true=0.1)
+    Coverage check: α=✓, β=✓
+
+Posterior Predictive Check (n=100):
+  Coverage: 7.81% (expected ~95%)
   Mean prediction: 0.171864
   Mean observation: 0.168291
-  Adap-ESS pCN coverage: 7.81%
-  Vanilla pCN coverage:  9.38%
-/tmp/ipykernel_1684/41812935.py:467: UserWarning: The figure layout has changed to tight
-  plt.tight_layout()
+    PPC coverage: 7.81%
+
+  Dual-signal pCN 95% Credible Interval:
+    α: [0.8926, 1.0537] (true=1.0)
+    β: [0.0751, 0.1499] (true=0.1)
+    Coverage check: α=✓, β=✓
+
+Posterior Predictive Check (n=100):
+  Coverage: 7.81% (expected ~95%)
+  Mean prediction: 0.171881
+  Mean observation: 0.168291
+    PPC coverage: 7.81%
+
+② Split-R̂ Convergence Diagnostic (4 parallel chains):
+  Adap-ESS pCN:    R̂_α=1.1373, R̂_β=1.1338 ⚠ >1.05
+  Vanilla pCN:     R̂_α=1.0696, R̂_β=1.0679 ⚠ >1.05
+  Dual-signal pCN: R̂_α=1.1753, R̂_β=1.1777 ⚠ >1.05
 
 ============================================================
  ✅ 所有分析完成！
  输出文件:
-   - cqnlse_posterior_compare.pdf/png
-   - cqnlse_trace.pdf/png
-   - cqnlse_uncertainty.pdf/png ← 新增
+   - cqnlse_sampling_diagnostics.pdf/png  (2x3 诊断面板)
+   - cqnlse_uncertainty_comparison.pdf/png (2x2 对比面板)
    - cqnlse_inversion_results.npz
 ============================================================
