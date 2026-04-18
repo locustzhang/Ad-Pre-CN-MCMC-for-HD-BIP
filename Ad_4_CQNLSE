@@ -5,9 +5,10 @@ import time
 from scipy.fftpack import fft, ifft
 import matplotlib.pyplot as plt
 from tabulate import tabulate
+from scipy.stats import gaussian_kde  # 🔥 新增：用于 KDE 平滑密度估计
 
 # ------------------------------------------------------------------------------
-# 🔥 论文原版绘图风格（完全和你之前保持一致）
+# 🔥 论文原版绘图风格（完全保持）
 # ------------------------------------------------------------------------------
 plt.rcParams.update({
     "font.family": "sans-serif",
@@ -24,7 +25,7 @@ plt.rcParams.update({
     "figure.dpi": 300,
     "savefig.dpi": 400,
     "savefig.transparent": False,
-    "figure.constrained_layout.use": True
+    "figure.constrained_layout.use": True  # 自动布局，替代 tight_layout
 })
 
 METHODS = ["Vanilla pCN", "Adap-ESS pCN", "Dual-signal pCN"]
@@ -35,7 +36,11 @@ METHOD_COLORS = {
 }
 MARKERS = {"Vanilla pCN": "o", "Adap-ESS pCN": "s", "Dual-signal pCN": "^"}
 LINESTYLES = {"Vanilla pCN": "-", "Adap-ESS pCN": "--", "Dual-signal pCN": "-."}
+
+# ✅ 核心修复：提前提取值列表，彻底杜绝字典遍历传 Key 的 Bug
 colors = [METHOD_COLORS[m] for m in METHODS]
+marker_list = [MARKERS[m] for m in METHODS]
+ls_list = [LINESTYLES[m] for m in METHODS]
 labels = METHODS
 
 # ------------------------------------------------------------------------------
@@ -96,17 +101,13 @@ def log_posterior(theta):
 # ------------------------------------------------------------------------------
 def ess_1d(series):
     n = len(series)
-    if n < 2:
-        return 1.0
-    if np.allclose(series, series[0], atol=1e-9):
-        return 1.0
+    if n < 2: return 1.0
+    if np.allclose(series, series[0], atol=1e-9): return 1.0
     s = series - series.mean()
     ac = np.correlate(s, s, mode='full')[n-1:]
     ac /= ac[0] + 1e-12
-    try:
-        cutoff = np.where(ac < 0)[0][0]
-    except:
-        cutoff = len(ac)
+    try: cutoff = np.where(ac < 0)[0][0]
+    except: cutoff = len(ac)
     ess = n / (1 + 2 * np.sum(ac[1:cutoff]))
     return max(ess, 1.0)
 
@@ -114,89 +115,51 @@ def ess_mean(samples):
     return np.mean([ess_1d(samples[:,i]) for i in range(samples.shape[1])])
 
 # ------------------------------------------------------------------------------
-# 🔥 新增：Split-R̂ 诊断（多链收敛性检查）
+# 🔥 Split-R̂ 诊断
 # ------------------------------------------------------------------------------
 def split_rhat(chains):
-    """
-    计算 Split-R̂ 诊断 (Gelman-Rubin diagnostic)
-    chains: np.array, shape (n_chains, n_samples, n_params)
-    返回：每个参数的 R̂ 值
-    """
     chains = np.asarray(chains, dtype=np.float64)
-    m, n, d = chains.shape  # n_chains, n_samples, n_params
-    
-    if n < 50:
-        return np.ones(d)
-    
-    # 每条链分成两半
+    m, n, d = chains.shape
+    if n < 50: return np.ones(d)
     n2 = n // 2
-    split_chains = np.concatenate([
-        chains[:, :n2, :], 
-        chains[:, n2:2*n2, :]
-    ], axis=0)  # shape: (2m, n/2, d)
-    
-    # 链间方差和链内方差
-    chain_means = split_chains.mean(axis=1)  # (2m, d)
-    chain_vars = split_chains.var(axis=1, ddof=1)  # (2m, d)
-    
-    W = chain_vars.mean(axis=0)  # 链内方差 (d,)
-    B = n2 * chain_means.var(axis=0, ddof=1)  # 链间方差 (d,)
-    
+    split_chains = np.concatenate([chains[:, :n2, :], chains[:, n2:2*n2, :]], axis=0)
+    chain_means = split_chains.mean(axis=1)
+    chain_vars = split_chains.var(axis=1, ddof=1)
+    W = chain_vars.mean(axis=0)
+    B = n2 * chain_means.var(axis=0, ddof=1)
     var_hat = ((n2 - 1) / n2) * W + (1 / n2) * B
-    Rhat = np.sqrt(var_hat / np.maximum(W, 1e-14))
-    
-    return Rhat
+    return np.sqrt(var_hat / np.maximum(W, 1e-14))
 
 # ------------------------------------------------------------------------------
-# 🔥 新增：95% Credible Interval 计算
+# 🔥 95% Credible Interval
 # ------------------------------------------------------------------------------
 def credible_interval(samples, ci=0.95):
-    """
-    计算后验样本的可信区间
-    samples: np.array, shape (n_samples, n_params)
-    ci: 可信区间水平 (默认 95%)
-    返回：每个参数的 [lower, upper] 区间
-    """
     alpha = 1 - ci
     lower = np.percentile(samples, 100 * alpha / 2, axis=0)
     upper = np.percentile(samples, 100 * (1 - alpha / 2), axis=0)
     return np.column_stack([lower, upper])
 
 # ------------------------------------------------------------------------------
-# 🔥 新增：Posterior Predictive Check (PPC)
+# 🔥 Posterior Predictive Check
 # ------------------------------------------------------------------------------
 def posterior_predictive_check(posterior_samples, n_ppc=100, verbose=True):
-    """
-    后验预测检查：从后验采样预测数据并与观测比较
-    posterior_samples: np.array, shape (n_samples, 2) [alpha, beta]
-    n_ppc: PPC 样本数量
-    返回：覆盖率（观测值落在预测区间内的比例）
-    """
     n_ppc = min(n_ppc, len(posterior_samples))
     indices = np.random.choice(len(posterior_samples), n_ppc, replace=False)
-    
     predictions = []
     for idx in indices:
         alpha_s, beta_s = posterior_samples[idx]
         _, u_pred = solve_cqnlse(alpha_s, beta_s)
-        predictions.append(u_pred.real)  # 🔥 取实部（观测数据也是实部）
-    
-    predictions = np.array(predictions)  # (n_ppc, N_grid)
-    
-    # 计算 95% 预测区间
+        predictions.append(u_pred.real)
+    predictions = np.array(predictions)
     lower = np.percentile(predictions, 2.5, axis=0)
     upper = np.percentile(predictions, 97.5, axis=0)
-    
-    # 检查观测值是否在预测区间内
     y_obs_real = y_obs.real
     coverage = np.mean((y_obs_real > lower) & (y_obs_real < upper))
-    
     if verbose:
         print(f"\nPosterior Predictive Check (n={n_ppc}):")
         print(f"  Coverage: {coverage:.2%} (expected ~95%)")
         print(f"  Mean prediction: {np.mean(predictions):.6f}")
         print(f"  Mean observation: {np.mean(y_obs_real):.6f}")
-    
     return coverage, predictions
 
 # ------------------------------------------------------------------------------
@@ -287,9 +250,9 @@ def beautify_ax(ax):
 def add_panel_label(ax, label):
     ax.text(-0.15, 1.1, f"({label})", transform=ax.transAxes, fontsize=11, fontweight="bold", va="top", ha="right")
 
-# ------------------------------------------------------------------------------
+# ==============================================================================
 # 主运行：三个算法对比 + 不确定性评估
-# ------------------------------------------------------------------------------
+# ==============================================================================
 if __name__ == '__main__':
     dim = 2
     x0 = torch.tensor(prior_mean, device=DEVICE)
@@ -305,7 +268,6 @@ if __name__ == '__main__':
     s_adp, ar_adp, t_adp = pcn_adap_ess(x0, init_beta, N, dim)
     s_dua, ar_dua, t_dua = pcn_dual(x0, init_beta, N, 2000, dim)
     
-    # 结果汇总
     res = []
     samples_list = [s_van, s_adp, s_dua]
     ar_list = [ar_van, ar_adp, ar_dua]
@@ -318,179 +280,220 @@ if __name__ == '__main__':
         b_est = post[:,1].mean()
         err_a = abs(a_est - alpha_true)
         err_b = abs(b_est - beta_true)
-        res.append([
-            name, 
-            f"{ar:.3f}", 
-            f"{ess:.1f}", 
-            f"{t:.2f}", 
-            f"{a_est:.4f}", 
-            f"{err_a:.4f}", 
-            f"{b_est:.4f}", 
-            f"{err_b:.4f}"
-        ])
+        res.append([name, f"{ar:.3f}", f"{ess:.1f}", f"{t:.2f}", f"{a_est:.4f}", f"{err_a:.4f}", f"{b_est:.4f}", f"{err_b:.4f}"])
     
-    # 打印对比表
     print("\n算法性能与反演精度对比")
-    print(tabulate(res, headers=[
-        "Method", "Acc", "ESS(mean)", "Time(s)", 
-        "α_est", "|α_err|", "β_est", "|β_err|"
-    ], tablefmt="grid"))
+    print(tabulate(res, headers=["Method", "Acc", "ESS(mean)", "Time(s)", "α_est", "|α_err|", "β_est", "|β_err|"], tablefmt="grid"))
     
-    # 反演结果汇总
     post_adap = s_adp[burn:]
     a_m, a_s = post_adap[:,0].mean(), post_adap[:,0].std()
     b_m, b_s = post_adap[:,1].mean(), post_adap[:,1].std()
     
     print("\nAdap-ESS pCN 最终反演结果")
-    print(tabulate([
-        ["α", alpha_true, a_m, a_s, a_m - alpha_true],
-        ["β", beta_true, b_m, b_s, b_m - beta_true]
-    ], headers=["Param", "True", "Mean", "Std", "Error"], tablefmt="grid"))
+    print(tabulate([["α", alpha_true, a_m, a_s, a_m - alpha_true], ["β", beta_true, b_m, b_s, b_m - beta_true]], headers=["Param", "True", "Mean", "Std", "Error"], tablefmt="grid"))
     
-    # ==============================================================================
-    # 🔥 新增：不确定性评估部分
-    # ==============================================================================
     print("\n" + "="*60)
     print(" 不确定性评估 (Uncertainty Quantification)")
     print("="*60)
     
-    # ① 95% Credible Interval
-    print("\n① 95% Credible Intervals:")
-    ci_adap = credible_interval(post_adap, ci=0.95)
-    print(f"  Adap-ESS pCN:")
-    print(f"    α: [{ci_adap[0,0]:.4f}, {ci_adap[0,1]:.4f}] (true={alpha_true})")
-    print(f"    β: [{ci_adap[1,0]:.4f}, {ci_adap[1,1]:.4f}] (true={beta_true})")
+    posts = [s_van[burn:], s_adp[burn:], s_dua[burn:]]
+    ppc_data = []
     
-    ci_van = credible_interval(s_van[burn:], ci=0.95)
-    print(f"  Vanilla pCN:")
-    print(f"    α: [{ci_van[0,0]:.4f}, {ci_van[0,1]:.4f}] (true={alpha_true})")
-    print(f"    β: [{ci_van[1,0]:.4f}, {ci_van[1,1]:.4f}] (true={beta_true})")
-    
-    # 检查真值是否在 CI 内
-    alpha_in_ci_van = ci_van[0,0] <= alpha_true <= ci_van[0,1]
-    beta_in_ci_van = ci_van[1,0] <= beta_true <= ci_van[1,1]
-    alpha_in_ci_adp = ci_adap[0,0] <= alpha_true <= ci_adap[0,1]
-    beta_in_ci_adp = ci_adap[1,0] <= beta_true <= ci_adap[1,1]
-    
-    print(f"\n  Coverage check:")
-    print(f"    Vanilla pCN: α={'✓' if alpha_in_ci_van else '✗'}, β={'✓' if beta_in_ci_van else '✗'}")
-    print(f"    Adap-ESS pCN: α={'✓' if alpha_in_ci_adp else '✗'}, β={'✓' if beta_in_ci_adp else '✗'}")
-    
-    # ② Split-R̂ 诊断（运行 4 条短链）
+    for name, post in zip(labels, posts):
+        ci = credible_interval(post, ci=0.95)
+        print(f"\n  {name} 95% Credible Interval:")
+        print(f"    α: [{ci[0,0]:.4f}, {ci[0,1]:.4f}] (true={alpha_true})")
+        print(f"    β: [{ci[1,0]:.4f}, {ci[1,1]:.4f}] (true={beta_true})")
+        
+        a_in = ci[0,0] <= alpha_true <= ci[0,1]
+        b_in = ci[1,0] <= beta_true <= ci[1,1]
+        print(f"    Coverage check: α={'✓' if a_in else '✗'}, β={'✓' if b_in else '✗'}")
+        
+        cov, pred = posterior_predictive_check(post, n_ppc=100)
+        ppc_data.append((cov, pred))
+        print(f"    PPC coverage: {cov:.2%}")
+        
+    # 🔥 补全第三种算法的 R̂ 诊断
     print("\n② Split-R̂ Convergence Diagnostic (4 parallel chains):")
     n_chains = 4
-    N_short = 3000  # 缩短每条链以节省时间
-    
-    all_chains_adap = []
-    all_chains_van = []
+    N_short = 3000
+    all_chains_adap, all_chains_van, all_chains_dua = [], [], []
     
     for c in range(n_chains):
-        torch.manual_seed(42 + c)  # 不同种子
+        torch.manual_seed(42 + c)
         np.random.seed(42 + c)
-        
         chain_adp, _, _ = pcn_adap_ess(x0, init_beta, N_short, dim)
         chain_van, _, _ = pcn_vanilla(x0, init_beta, N_short)
-        
+        chain_dua, _, _ = pcn_dual(x0, init_beta, N_short, 2000, dim)
         all_chains_adap.append(chain_adp[burn:])
         all_chains_van.append(chain_van[burn:])
-    
-    all_chains_adap = np.stack(all_chains_adap, axis=0)  # (4, 1500, 2)
-    all_chains_van = np.stack(all_chains_van, axis=0)
+        all_chains_dua.append(chain_dua[burn:])
+        
+    all_chains_adap = np.stack(all_chains_adap, axis=0)
+    all_chains_van  = np.stack(all_chains_van, axis=0)
+    all_chains_dua  = np.stack(all_chains_dua, axis=0)
     
     rhat_adap = split_rhat(all_chains_adap)
-    rhat_van = split_rhat(all_chains_van)
+    rhat_van  = split_rhat(all_chains_van)
+    rhat_dua  = split_rhat(all_chains_dua)
     
-    print(f"  Adap-ESS pCN: R̂_α={rhat_adap[0]:.4f}, R̂_β={rhat_adap[1]:.4f} {'✓ <1.05' if max(rhat_adap)<1.05 else '⚠ >1.05'}")
-    print(f"  Vanilla pCN:  R̂_α={rhat_van[0]:.4f}, R̂_β={rhat_van[1]:.4f} {'✓ <1.05' if max(rhat_van)<1.05 else '⚠ >1.05'}")
-    
-    # ③ Posterior Predictive Check
-    print("\n③ Posterior Predictive Check (PPC):")
-    coverage_adap, ppc_pred_adap = posterior_predictive_check(post_adap, n_ppc=100)
-    coverage_van, ppc_pred_van = posterior_predictive_check(s_van[burn:], n_ppc=100)
-    
-    print(f"  Adap-ESS pCN coverage: {coverage_adap:.2%}")
-    print(f"  Vanilla pCN coverage:  {coverage_van:.2%}")
-    
+    print(f"  Adap-ESS pCN:    R̂_α={rhat_adap[0]:.4f}, R̂_β={rhat_adap[1]:.4f} {'✓ <1.05' if max(rhat_adap)<1.05 else '⚠ >1.05'}")
+    print(f"  Vanilla pCN:     R̂_α={rhat_van[0]:.4f}, R̂_β={rhat_van[1]:.4f} {'✓ <1.05' if max(rhat_van)<1.05 else '⚠ >1.05'}")
+    print(f"  Dual-signal pCN: R̂_α={rhat_dua[0]:.4f}, R̂_β={rhat_dua[1]:.4f} {'✓ <1.05' if max(rhat_dua)<1.05 else '⚠ >1.05'}")
+
     # ==============================================================================
-    # 🔥 图 3：新增不确定性评估图（CI + PPC）
+    # 📊 Figure 1: 升级为 2x3 诊断面板 (Trace, ACF, KDE 全覆盖 α/β)
     # ==============================================================================
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    traces_alpha = [s[burn:, 0] for s in samples_list]
+    traces_beta  = [s[burn:, 1] for s in samples_list]
     
-    # (a) 95% CI 对比
-    ax = axes[0]
+    def compute_acf(series, max_lag=40):
+        n = len(series)
+        s = series - series.mean()
+        acf = np.correlate(s, s, mode='full')[n-1:]
+        return (acf[:max_lag+1] / (acf[0] + 1e-12))
+
+    acfs_alpha = [compute_acf(tr) for tr in traces_alpha]
+    acfs_beta  = [compute_acf(tr) for tr in traces_beta]
+
+    fig1, axes1 = plt.subplots(2, 3, figsize=(13, 8))
+
+    # (a) α Trace, (b) β Trace
+    for col in range(2):
+        ax = axes1[0, col]
+        tr_list = traces_alpha if col == 0 else traces_beta
+        for i, (name, c, m, ls) in enumerate(zip(METHODS, colors, marker_list, ls_list)):
+            ax.plot(tr_list[i], color=c, marker=m, markevery=max(1, len(tr_list[i])//60),
+                    markersize=3, linestyle=ls, linewidth=1.0, label=name if col==0 else "", alpha=0.85)
+        true_val = alpha_true if col == 0 else beta_true
+        ax.axhline(true_val, color='k', linestyle=':', linewidth=1.2, alpha=0.6, label='True' if col==0 else "")
+        ax.set_ylabel(r'$\alpha$' if col==0 else r'$\beta$')
+        ax.set_xlabel('Iteration')
+        if col == 0: ax.legend(frameon=False, fontsize=7, loc='upper right')
+        beautify_ax(ax); add_panel_label(ax, chr(97+col))
+
+    # (c) α ACF, (d) β ACF
+    ax = axes1[0, 2]
+    for i, (name, c, m, ls) in enumerate(zip(METHODS, colors, marker_list, ls_list)):
+        ax.plot(range(len(acfs_alpha[i])), acfs_alpha[i], color=c, marker=m, markersize=4,
+                linestyle=ls, linewidth=1.2, label=name)
+    ax.axhline(0.05, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
+    ax.set_ylabel(r'ACF ($\alpha$)'); ax.set_xlabel('Lag')
+    ax.legend(frameon=False, fontsize=7, loc='upper right')
+    beautify_ax(ax); add_panel_label(ax, 'c')
+
+    ax = axes1[1, 0]
+    for i, (name, c, m, ls) in enumerate(zip(METHODS, colors, marker_list, ls_list)):
+        ax.plot(range(len(acfs_beta[i])), acfs_beta[i], color=c, marker=m, markersize=4,
+                linestyle=ls, linewidth=1.2, label=name)
+    ax.axhline(0.05, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
+    ax.set_ylabel(r'ACF ($\beta$)'); ax.set_xlabel('Lag')
+    beautify_ax(ax); add_panel_label(ax, 'd')
+
+    # (e) α KDE, (f) β KDE
+    for col in range(2):
+        ax = axes1[1, col+1]
+        tr_list = traces_alpha if col == 0 else traces_beta
+        x_min = min(tr.min() for tr in tr_list)
+        x_max = max(tr.max() for tr in tr_list)
+        pad = 0.12 * (x_max - x_min)
+        x_kde = np.linspace(x_min - pad, x_max + pad, 400)
+        for i, (name, c, ls) in enumerate(zip(METHODS, colors, ls_list)):
+            kde = gaussian_kde(tr_list[i], bw_method='scott')
+            y_kde = kde(x_kde)
+            ax.plot(x_kde, y_kde, color=c, linestyle=ls, linewidth=1.6, label=name if col==0 else "")
+        true_val = alpha_true if col == 0 else beta_true
+        ax.axvline(true_val, color='k', linestyle=':', linewidth=1.2, alpha=0.6, label='True' if col==0 else "")
+        ax.set_xlabel(r'$\alpha$' if col==0 else r'$\beta$')
+        ax.set_ylabel('Density')
+        if col == 0: ax.legend(frameon=False, fontsize=7, loc='upper right')
+        beautify_ax(ax); add_panel_label(ax, chr(97+col+4))
+
+    plt.savefig("cqnlse_sampling_diagnostics.png", bbox_inches='tight', dpi=400)
+    plt.savefig("cqnlse_sampling_diagnostics.pdf", bbox_inches='tight')
+    plt.close(fig1)
+
+    # ==============================================================================
+    # 📊 Figure 2: 不确定性量化与性能对比 (2x2)
+    # ==============================================================================
+    ppc_pred_van, ppc_pred_adap, ppc_pred_dual = [p for _, p in ppc_data]
+    
+    fig2, axes2 = plt.subplots(2, 2, figsize=(10, 8))
+    ax = axes2[0, 0]
     x_pos = np.array([1, 2])
-    width = 0.35
-    
-    # α 的 CI
-    ax.errorbar(x_pos[0]-width/2, a_m, yerr=[[a_m - ci_adap[0,0]], [ci_adap[0,1] - a_m]], 
-                fmt='s', color=colors[1], capsize=5, label='Adap-ESS pCN (α)', linewidth=1.5)
-    ax.errorbar(x_pos[0]+width/2, post_adap[:,0].mean(), 
-                yerr=[[post_adap[:,0].mean() - ci_van[0,0]], [ci_van[0,1] - post_adap[:,0].mean()]], 
-                fmt='o', color=colors[0], capsize=5, label='Vanilla pCN (α)', linewidth=1.5)
-    
-    # β 的 CI（缩放后显示）
-    ax.errorbar(x_pos[1]-width/2, b_m*10, yerr=[[b_m*10 - ci_adap[1,0]*10], [ci_adap[1,1]*10 - b_m*10]], 
-                fmt='s', color=colors[1], capsize=5, label='Adap-ESS pCN (β×10)', linewidth=1.5)
-    ax.errorbar(x_pos[1]+width/2, post_adap[:,1].mean()*10, 
-                yerr=[[post_adap[:,1].mean()*10 - ci_van[1,0]*10], [ci_van[1,1]*10 - post_adap[:,1].mean()*10]], 
-                fmt='o', color=colors[0], capsize=5, label='Vanilla pCN (β×10)', linewidth=1.5)
-    
-    # 真实值标记
-    ax.axhline(alpha_true, color='black', linestyle='--', linewidth=1, alpha=0.5, label='True α')
-    ax.axhline(beta_true*10, color='black', linestyle=':', linewidth=1, alpha=0.5, label='True β×10')
-    
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(['α', 'β (×10)'])
+    width = 0.2
+    for i, (name, c, m) in enumerate(zip(METHODS, colors, marker_list)):
+        ci = credible_interval(samples_list[i][burn:])
+        mu_a, mu_b = samples_list[i][burn:, 0].mean(), samples_list[i][burn:, 1].mean() * 10
+        ci_a, ci_b = ci[0], ci[1] * 10
+        offset = (i - 1) * width
+        ax.errorbar(x_pos[0] + offset, mu_a, yerr=[[mu_a - ci_a[0]], [ci_a[1] - mu_a]], 
+                    fmt=m, color=c, capsize=4, linewidth=1.2, label=f'{name} (α)', linestyle='none')
+        ax.errorbar(x_pos[1] + offset, mu_b, yerr=[[mu_b - ci_b[0]], [ci_b[1] - mu_b]], 
+                    fmt=m, color=c, capsize=4, linewidth=1.2, label=f'{name} (β×10)', linestyle='none')
+    ax.axhline(alpha_true, color='k', linestyle='--', linewidth=1, alpha=0.6, label='True α')
+    ax.axhline(beta_true*10, color='k', linestyle=':', linewidth=1, alpha=0.6, label='True β×10')
+    ax.set_xticks(x_pos); ax.set_xticklabels(['α', 'β (×10)'])
     ax.set_ylabel('Posterior Mean ± 95% CI')
-    beautify_ax(ax)
-    ax.legend(loc='upper right', frameon=False, fontsize=7)
-    add_panel_label(ax, 'a')
-    
-    # (b) PPC 预测区间
-    ax = axes[1]
-    x_grid_plot = x_grid
-    ppc_mean = np.mean(ppc_pred_adap, axis=0)
-    ppc_lower = np.percentile(ppc_pred_adap, 2.5, axis=0)
-    ppc_upper = np.percentile(ppc_pred_adap, 97.5, axis=0)
-    
-    ax.fill_between(x_grid_plot, ppc_lower, ppc_upper, alpha=0.3, color=colors[1], label='95% Predictive Interval')
-    ax.plot(x_grid_plot, ppc_mean, color=colors[1], linewidth=1.5, label='PPC Mean')
-    ax.plot(x_grid_plot, y_obs.real, color='black', linewidth=0.8, linestyle='--', label='Observation')
-    
-    ax.set_xlabel('Spatial grid')
-    ax.set_ylabel('Wave amplitude')
-    ax.set_title(f'Posterior Predictive Check (coverage={coverage_adap:.1%})')
-    beautify_ax(ax)
-    ax.legend(loc='upper right', frameon=False, fontsize=7)
-    add_panel_label(ax, 'b')
-    
-    plt.tight_layout()
-    plt.savefig("cqnlse_uncertainty.png", bbox_inches='tight', dpi=400)
-    plt.savefig("cqnlse_uncertainty.pdf", bbox_inches='tight')
-    plt.close()
-    
+    ax.legend(frameon=False, fontsize=6, loc='upper right')
+    beautify_ax(ax); add_panel_label(ax, 'a')
+
+    ax = axes2[0, 1]
+    ppc_plot_data = [(ppc_pred_van, colors[0], METHODS[0]), (ppc_pred_adap, colors[1], METHODS[1]), (ppc_pred_dual, colors[2], METHODS[2])]
+    for pred, c, name in ppc_plot_data:
+        ppc_mean = np.mean(pred, axis=0)
+        ppc_lower = np.percentile(pred, 2.5, axis=0)
+        ppc_upper = np.percentile(pred, 97.5, axis=0)
+        ax.fill_between(x_grid, ppc_lower, ppc_upper, alpha=0.15, color=c)
+        ax.plot(x_grid, ppc_mean, color=c, linewidth=1.2, linestyle=LINESTYLES[name], label=name)
+    ax.plot(x_grid, y_obs.real, color='k', linewidth=1.0, linestyle='--', label='Observation')
+    ax.set_xlabel('Spatial grid'); ax.set_ylabel('Wave amplitude')
+    ax.set_title('Posterior Predictive Check')
+    ax.legend(frameon=False, fontsize=7, loc='upper right')
+    beautify_ax(ax); add_panel_label(ax, 'b')
+
+    # 🔥 补全第三种算法的 R̂ 柱状图
+    ax = axes2[1, 0]
+    rhat_vals = np.array([rhat_van[0], rhat_adap[0], rhat_dua[0]])
+    ax.bar([1, 2, 3], rhat_vals, width=0.4, color=colors, edgecolor='k', linewidth=0.8)
+    ax.axhline(1.05, color='r', linestyle='--', linewidth=1.2, alpha=0.8, label='R̂=1.05 threshold')
+    ax.set_xticks([1, 2, 3]); ax.set_xticklabels(['Vanilla pCN', 'Adap-ESS pCN', 'Dual-signal pCN'])
+    ax.set_ylabel('Split-R̂ (α)')
+    ax.legend(frameon=False, fontsize=7, loc='upper left')
+    beautify_ax(ax); add_panel_label(ax, 'c')
+
+    ax = axes2[1, 1]
+    ess_vals = [float(r[2]) for r in res]
+    time_vals = [float(r[3]) for r in res]
+    x_bar = np.arange(3)
+    ax.bar(x_bar - 0.15, ess_vals, width=0.3, color=colors, edgecolor='k', linewidth=0.8, label='ESS')
+    ax2 = ax.twinx()
+    ax2.bar(x_bar + 0.15, time_vals, width=0.3, color=[c+'80' for c in colors], edgecolor='k', linewidth=0.8, label='Time (s)')
+    ax.set_xticks(x_bar); ax.set_xticklabels(METHODS)
+    ax.set_ylabel('ESS'); ax2.set_ylabel('Time (s)')
+    ax.legend(loc='upper left', frameon=False, fontsize=6)
+    ax2.legend(loc='upper right', frameon=False, fontsize=6)
+    beautify_ax(ax); add_panel_label(ax, 'd')
+
+    plt.savefig("cqnlse_uncertainty_comparison.png", bbox_inches='tight', dpi=400)
+    plt.savefig("cqnlse_uncertainty_comparison.pdf", bbox_inches='tight')
+    plt.close(fig2)
+
     # --------------------------------------------------------------------------
-    # 保存所有数据（包括不确定性评估）
+    # 保存所有数据
     # --------------------------------------------------------------------------
     np.savez("cqnlse_inversion_results.npz",
-             alpha_true=alpha_true,
-             beta_true=beta_true,
-             samples_vanilla=s_van[burn:],
-             samples_adap=s_adp[burn:],
-             samples_dual=s_dua[burn:],
-             ci_vanilla=ci_van,
-             ci_adap=ci_adap,
-             rhat_vanilla=rhat_van,
-             rhat_adap=rhat_adap,
-             ppc_coverage_adap=coverage_adap,
-             ppc_coverage_van=coverage_van,
-             ppc_predictions=ppc_pred_adap)
-    
+             alpha_true=alpha_true, beta_true=beta_true,
+             samples_vanilla=s_van[burn:], samples_adap=s_adp[burn:], samples_dual=s_dua[burn:],
+             ci_vanilla=credible_interval(s_van[burn:]), ci_adap=credible_interval(s_adp[burn:]), ci_dual=credible_interval(s_dua[burn:]),
+             rhat_vanilla=rhat_van, rhat_adap=rhat_adap, rhat_dua=rhat_dua,
+             ppc_coverage_van=ppc_data[0][0], ppc_coverage_adap=ppc_data[1][0], ppc_coverage_dual=ppc_data[2][0],
+             ppc_predictions_van=ppc_pred_van, ppc_predictions_adap=ppc_pred_adap, ppc_predictions_dual=ppc_pred_dual)
+
     print("\n" + "="*60)
     print(" ✅ 所有分析完成！")
     print(" 输出文件:")
-    print("   - cqnlse_posterior_compare.pdf/png")
-    print("   - cqnlse_trace.pdf/png")
-    print("   - cqnlse_uncertainty.pdf/png ← 新增")
+    print("   - cqnlse_sampling_diagnostics.pdf/png  (2x3 诊断面板)")
+    print("   - cqnlse_uncertainty_comparison.pdf/png (2x2 对比面板)")
     print("   - cqnlse_inversion_results.npz")
     print("="*60)
