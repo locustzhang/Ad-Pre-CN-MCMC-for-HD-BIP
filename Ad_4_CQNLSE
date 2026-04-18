@@ -28,14 +28,14 @@ plt.rcParams.update({
     "figure.constrained_layout.use": True  # 自动布局，替代 tight_layout
 })
 
-METHODS = ["Vanilla pCN", "Adap-ESS pCN", "Dual-signal pCN"]
+METHODS = ["Vanilla pCN", "Acceptance-Rate Adaptive pCN", "Dual-Signal pCN"]
 METHOD_COLORS = {
     "Vanilla pCN": "#4D4D4D",
-    "Adap-ESS pCN": "#D62728",
-    "Dual-signal pCN": "#009E73",
+    "Acceptance-Rate Adaptive pCN": "#D62728",
+    "Dual-Signal pCN": "#009E73",
 }
-MARKERS = {"Vanilla pCN": "o", "Adap-ESS pCN": "s", "Dual-signal pCN": "^"}
-LINESTYLES = {"Vanilla pCN": "-", "Adap-ESS pCN": "--", "Dual-signal pCN": "-."}
+MARKERS = {"Vanilla pCN": "o", "Acceptance-Rate Adaptive pCN": "s", "Dual-Signal pCN": "^"}
+LINESTYLES = {"Vanilla pCN": "-", "Acceptance-Rate Adaptive pCN": "--", "Dual-Signal pCN": "-."}
 
 # ✅ 核心修复：提前提取值列表，彻底杜绝字典遍历传 Key 的 Bug
 colors = [METHOD_COLORS[m] for m in METHODS]
@@ -289,7 +289,7 @@ if __name__ == '__main__':
     a_m, a_s = post_adap[:,0].mean(), post_adap[:,0].std()
     b_m, b_s = post_adap[:,1].mean(), post_adap[:,1].std()
     
-    print("\nAdap-ESS pCN 最终反演结果")
+    print("\nAcceptance-Rate Adaptive pCN 最终反演结果")
     print(tabulate([["α", alpha_true, a_m, a_s, a_m - alpha_true], ["β", beta_true, b_m, b_s, b_m - beta_true]], headers=["Param", "True", "Mean", "Std", "Error"], tablefmt="grid"))
     
     print("\n" + "="*60)
@@ -337,9 +337,9 @@ if __name__ == '__main__':
     rhat_van  = split_rhat(all_chains_van)
     rhat_dua  = split_rhat(all_chains_dua)
     
-    print(f"  Adap-ESS pCN:    R̂_α={rhat_adap[0]:.4f}, R̂_β={rhat_adap[1]:.4f} {'✓ <1.05' if max(rhat_adap)<1.05 else '⚠ >1.05'}")
+    print(f"  Acceptance-Rate Adaptive pCN:    R̂_α={rhat_adap[0]:.4f}, R̂_β={rhat_adap[1]:.4f} {'✓ <1.05' if max(rhat_adap)<1.05 else '⚠ >1.05'}")
     print(f"  Vanilla pCN:     R̂_α={rhat_van[0]:.4f}, R̂_β={rhat_van[1]:.4f} {'✓ <1.05' if max(rhat_van)<1.05 else '⚠ >1.05'}")
-    print(f"  Dual-signal pCN: R̂_α={rhat_dua[0]:.4f}, R̂_β={rhat_dua[1]:.4f} {'✓ <1.05' if max(rhat_dua)<1.05 else '⚠ >1.05'}")
+    print(f"  Dual-Signal pCN: R̂_α={rhat_dua[0]:.4f}, R̂_β={rhat_dua[1]:.4f} {'✓ <1.05' if max(rhat_dua)<1.05 else '⚠ >1.05'}")
 
     # ==============================================================================
     # 📊 Figure 1: 升级为 2x3 诊断面板 (Trace, ACF, KDE 全覆盖 α/β)
@@ -369,7 +369,7 @@ if __name__ == '__main__':
         ax.axhline(true_val, color='k', linestyle=':', linewidth=1.2, alpha=0.6, label='True' if col==0 else "")
         ax.set_ylabel(r'$\alpha$' if col==0 else r'$\beta$')
         ax.set_xlabel('Iteration')
-        if col == 0: ax.legend(frameon=False, fontsize=7, loc='upper right')
+        if col == 0: ax.legend(frameon=False, fontsize=7, loc='upper left')
         beautify_ax(ax); add_panel_label(ax, chr(97+col))
 
     # (c) α ACF, (d) β ACF
@@ -406,7 +406,7 @@ if __name__ == '__main__':
         ax.axvline(true_val, color='k', linestyle=':', linewidth=1.2, alpha=0.6, label='True' if col==0 else "")
         ax.set_xlabel(r'$\alpha$' if col==0 else r'$\beta$')
         ax.set_ylabel('Density')
-        if col == 0: ax.legend(frameon=False, fontsize=7, loc='upper right')
+        if col == 0: ax.legend(frameon=False, fontsize=7, loc='upper left')
         beautify_ax(ax); add_panel_label(ax, chr(97+col+4))
 
     plt.savefig("cqnlse_sampling_diagnostics.png", bbox_inches='tight', dpi=400)
@@ -435,7 +435,7 @@ if __name__ == '__main__':
     ax.axhline(beta_true*10, color='k', linestyle=':', linewidth=1, alpha=0.6, label='True β×10')
     ax.set_xticks(x_pos); ax.set_xticklabels(['α', 'β (×10)'])
     ax.set_ylabel('Posterior Mean ± 95% CI')
-    ax.legend(frameon=False, fontsize=6, loc='upper right')
+    ax.legend(frameon=False, fontsize=6, loc='upper left')
     beautify_ax(ax); add_panel_label(ax, 'a')
 
     ax = axes2[0, 1]
@@ -449,7 +449,7 @@ if __name__ == '__main__':
     ax.plot(x_grid, y_obs.real, color='k', linewidth=1.0, linestyle='--', label='Observation')
     ax.set_xlabel('Spatial grid'); ax.set_ylabel('Wave amplitude')
     ax.set_title('Posterior Predictive Check')
-    ax.legend(frameon=False, fontsize=7, loc='upper right')
+    ax.legend(frameon=False, fontsize=7, loc='upper left')
     beautify_ax(ax); add_panel_label(ax, 'b')
 
     # 🔥 补全第三种算法的 R̂ 柱状图
@@ -457,7 +457,7 @@ if __name__ == '__main__':
     rhat_vals = np.array([rhat_van[0], rhat_adap[0], rhat_dua[0]])
     ax.bar([1, 2, 3], rhat_vals, width=0.4, color=colors, edgecolor='k', linewidth=0.8)
     ax.axhline(1.05, color='r', linestyle='--', linewidth=1.2, alpha=0.8, label='R̂=1.05 threshold')
-    ax.set_xticks([1, 2, 3]); ax.set_xticklabels(['Vanilla pCN', 'Adap-ESS pCN', 'Dual-signal pCN'])
+    ax.set_xticks([1, 2, 3]); ax.set_xticklabels(['Vanilla pCN', 'Acceptance-Rate Adaptive pCN', 'Dual-Signal pCN'])
     ax.set_ylabel('Split-R̂ (α)')
     ax.legend(frameon=False, fontsize=7, loc='upper left')
     beautify_ax(ax); add_panel_label(ax, 'c')
@@ -472,7 +472,7 @@ if __name__ == '__main__':
     ax.set_xticks(x_bar); ax.set_xticklabels(METHODS)
     ax.set_ylabel('ESS'); ax2.set_ylabel('Time (s)')
     ax.legend(loc='upper left', frameon=False, fontsize=6)
-    ax2.legend(loc='upper right', frameon=False, fontsize=6)
+    ax2.legend(loc='upper left', frameon=False, fontsize=6)
     beautify_ax(ax); add_panel_label(ax, 'd')
 
     plt.savefig("cqnlse_uncertainty_comparison.png", bbox_inches='tight', dpi=400)
