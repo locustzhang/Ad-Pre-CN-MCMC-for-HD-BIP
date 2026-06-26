@@ -1,0 +1,1461 @@
+# === IMPORTS & GLOBAL CONFIGURATION ===
+import os
+import math
+import time
+import json
+import hashlib
+import inspect
+import numpy as np
+import torch
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
+from scipy.fft import fft, ifft
+from tabulate import tabulate
+try: from tqdm.auto import tqdm; TQDM_AVAILABLE = True
+except Exception: TQDM_AVAILABLE = False
+
+# 自动检测torch.compile可用性
+try:
+    import torch.compile
+    COMPILE_AVAILABLE = True
+except Exception:
+    COMPILE_AVAILABLE = False
+
+# --- Seeds & Device ---
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DTYPE = torch.float64
+torch.set_default_dtype(DTYPE)
+
+# --- Output & Checkpoint directories ---
+OUTDIR = "unified_results0625"
+CKPT_DIR = os.path.join(OUTDIR, "checkpoints")
+os.makedirs(OUTDIR, exist_ok=True)
+os.makedirs(os.path.join(CKPT_DIR, "lg"), exist_ok=True)
+os.makedirs(os.path.join(CKPT_DIR, "cqnlse"), exist_ok=True)
+os.makedirs(os.path.join(CKPT_DIR, "sensitivity"), exist_ok=True)
+os.makedirs(os.path.join(CKPT_DIR, "multiseed"), exist_ok=True)
+
+LOGFILE = os.path.join(OUTDIR, "run_log.txt")
+with open(LOGFILE, "w", encoding="utf-8") as f: pass
+
+def logprint(msg: str):
+    print(msg)
+    with open(LOGFILE, "a", encoding="utf-8") as f:
+        f.write(msg + "\n")
+
+logprint(f"Device={DEVICE} | dtype={DTYPE} | seed={SEED}")
+logprint(f"Output folder: {OUTDIR}")
+logprint(f"Checkpoint folder: {CKPT_DIR}")
+logprint(f"Torch compile available: {COMPILE_AVAILABLE}")
+
+# --- Method registry ---
+METHODS = [
+    "Vanilla pCN",
+    "Acceptance-Rate Adaptive pCN",
+    "Dual-Signal pCN",
+    "Adaptive Metropolis",
+    "MALA",
+]
+
+METHOD_COLORS = {
+    "Vanilla pCN": "#4D4D4D",
+    "Acceptance-Rate Adaptive pCN": "#B2182B",
+    "Dual-Signal pCN": "#1A9850",
+    "Adaptive Metropolis": "#35978F",
+    "MALA": "#8C510A",
+}
+
+MARKERS = {
+    "Vanilla pCN": "o",
+    "Acceptance-Rate Adaptive pCN": "s",
+    "Dual-Signal pCN": "^",
+    "Adaptive Metropolis": "D",
+    "MALA": "v",
+}
+
+LINESTYLES = {
+    "Vanilla pCN": "-",
+    "Acceptance-Rate Adaptive pCN": "--",
+    "Dual-Signal pCN": "-.",
+    "Adaptive Metropolis": ":",
+    "MALA": (0, (3, 1, 1, 1)),
+}
+
+# --- Default hyperparameters ---
+DEFAULT_ADAPT = {
+    "target_ar": 0.234,
+    "adapt_interval": 200,
+    "adapt_interval_cqnlse": 50,
+    "burn_frac": 0.30,
+    "burn_frac_cqnlse": 0.25,
+    "gamma_base": 0.12,
+    "t_switch_frac": 0.5,
+    "ess_block": 2000,
+    "ess_block_cqnlse": 500,
+}
+
+# --- Experiment budget ---
+EVAL_BUDGET_LG = 20000
+EVAL_BUDGET_CQNLSE = 6000
+EVAL_BUDGET_CQNLSE_EXT = 20000
+N_CHAINS = 4
+
+# === UTILITY FUNCTIONS ===
+class EvalCounter:
+    """全局函数评估计数器。
+    计数逻辑嵌入 log_post 函数内部，确保有限差分梯度等嵌套调用也被正确统计。
+    """
+    def __init__(self):
+        self.count = 0
+    
+    def reset(self):
+        self.count = 0
+    
+    def inc(self, k=1):
+        self.count += int(k)
+
+EVAL = EvalCounter()
+
+def ess_1d(series):
+    series = np.asarray(series, dtype=np.float64)
+    n = len(series)
+    if n < 30:
+        return float(max(1, n))
+    if np.allclose(series, series[0], atol=1e-12):
+        return 1.0
+    series = series - series.mean()
+    ac = np.correlate(series, series, mode="full")[n - 1:]
+    ac = ac / (ac[0] + 1e-30)
+    cutoff = min(n, 4000)
+    for k in range(1, cutoff):
+        if ac[k] < 0:
+            cutoff = k
+            break
+    tau = 1.0 + 2.0 * np.sum(ac[1:cutoff])
+    ess = n / max(tau, 1e-12)
+    return float(max(1.0, min(n, ess)))
+
+def ess_mean(samples):
+    samples = np.asarray(samples, dtype=np.float64)
+    d = samples.shape[1]
+    return float(np.mean([ess_1d(samples[:, i]) for i in range(d)]))
+
+def ess_min(samples):
+    samples = np.asarray(samples, dtype=np.float64)
+    d = samples.shape[1]
+    return float(np.min([ess_1d(samples[:, i]) for i in range(d)]))
+
+def split_rhat(chains):
+    chains = np.asarray(chains, dtype=np.float64)
+    m, n, d = chains.shape
+    if n < 50:
+        return np.ones(d)
+    n2 = n // 2
+    split = np.concatenate([chains[:, :n2, :], chains[:, n2:2*n2, :]], axis=0)
+    chain_means = split.mean(axis=1)
+    chain_vars = split.var(axis=1, ddof=1)
+    W = chain_vars.mean(axis=0)
+    B = n2 * chain_means.var(axis=0, ddof=1)
+    var_hat = ((n2 - 1) / n2) * W + (1 / n2) * B
+    Rhat = np.sqrt(var_hat / np.maximum(W, 1e-14))
+    return Rhat
+
+def autocorr(x, max_lag=200):
+    x = np.asarray(x, dtype=np.float64)
+    x = x - x.mean()
+    n = len(x)
+    if n < 5:
+        return np.zeros(max_lag)
+    ac = np.correlate(x, x, mode="full")[n-1:]
+    ac = ac / (ac[0] + 1e-30)
+    return ac[:max_lag]
+
+def smooth_w(t, t0, s=0.2):
+    return 1.0 / (1.0 + math.exp(-(t - t0) / (s * t0 + 1e-12)))
+
+def credible_interval(samples, ci=0.95):
+    alpha = 1 - ci
+    lower = np.percentile(samples, 100 * alpha / 2, axis=0)
+    upper = np.percentile(samples, 100 * (1 - alpha / 2), axis=0)
+    return np.column_stack([lower, upper])
+
+# === CHECKPOINT INFRASTRUCTURE ===
+# Per-(exp, dim, method) checkpointing with manifest tracking.
+# Interrupt-safe: re-run the notebook to resume from last checkpoint.
+
+def _seed_from_key(key: str, base_seed: int = SEED) -> int:
+    """Deterministic seed from a string key (ensures reproducibility)."""
+    h = int(hashlib.md5(f"{key}_{base_seed}".encode()).hexdigest()[:8], 16)
+    return h % (2**31)
+
+def set_problem_seed(exp_name: str, dim: int, base_seed: int = SEED):
+    """Set deterministic seeds for problem construction.
+    Calling this before build_linear_gaussian() / build_cqnlse() ensures the problem
+    instance is identical regardless of execution order or which previous experiments have been run.
+    """
+    seed = _seed_from_key(f"problem_{exp_name}_{dim}", base_seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    return seed
+
+def set_chain_seed(exp_name: str, dim: int, method: str, chain_idx: int, base_seed: int = SEED):
+    """Set deterministic seeds for a specific MCMC chain."""
+    seed = _seed_from_key(f"chain_{exp_name}_{dim}_{method}_{chain_idx}", base_seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    return seed
+
+def _safe_name(name: str) -> str:
+    """Convert method/exp name to filesystem-safe string."""
+    return name.replace(" ", "_").replace("-", "_").replace(".", "_")
+
+def save_checkpoint(category: str, name: str, **arrays):
+    """Save arrays to a checkpoint .npz file."""
+    path = os.path.join(CKPT_DIR, category, name + ".npz")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    np.savez_compressed(path, **arrays)
+    return path
+
+def load_checkpoint(category: str, name: str):
+    """Load arrays from a checkpoint .npz file. Returns None if not found."""
+    path = os.path.join(CKPT_DIR, category, name + ".npz")
+    if not os.path.exists(path):
+        return None
+    return dict(np.load(path, allow_pickle=True))
+
+# --- Manifest management ---
+def load_manifest():
+    """Load or initialize the checkpoint manifest."""
+    path = os.path.join(CKPT_DIR, "manifest.json")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"completed": [], "cqnlse": [], "sensitivity": [], "multiseed": []}
+
+def save_manifest(manifest):
+    """Save the checkpoint manifest."""
+    path = os.path.join(CKPT_DIR, "manifest.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+def is_completed(manifest, exp, dim, method):
+    """Check if an LG experiment-method-dim combination is completed."""
+    for item in manifest["completed"]:
+        if item["exp"] == exp and item["dim"] == dim and item["method"] == method:
+            return True
+    return False
+
+def is_cqnlse_completed(manifest, method):
+    """Check if a CQNLSE method run is completed."""
+    for item in manifest["cqnlse"]:
+        if item["method"] == method:
+            return True
+    return False
+
+def is_sensitivity_completed(manifest, param, value):
+    """Check if a sensitivity parameter-value pair is completed."""
+    key = f"{param}_{value}"
+    for item in manifest["sensitivity"]:
+        if item["key"] == key:
+            return True
+    return False
+
+def is_multiseed_completed(manifest, method, seed):
+    """Check if a multiseed method-seed pair is completed."""
+    for item in manifest["multiseed"]:
+        if item["method"] == method and item["seed"] == seed:
+            return True
+    return False
+
+def register_completed(manifest, category, **info):
+    """Register a completed item in the manifest and save."""
+    manifest[category].append(info)
+    save_manifest(manifest)
+
+logprint("Checkpoint infrastructure initialized.")
+logprint(f"  Manifest: {os.path.join(CKPT_DIR, 'manifest.json')}")
+
+# === MCMC ALGORITHMS (5 methods) ===
+# ---------------------------------------------------------------------------
+# 3.1 Vanilla pCN — 预计算常量优化
+# ---------------------------------------------------------------------------
+def pcn_vanilla(x0, log_post_fn, sqrtL, beta, N):
+    """Vanilla pCN with fixed step size."""
+    dim = x0.numel()
+    x = x0.clone().flatten()
+    samples = np.empty((N, dim), dtype=np.float64)
+    acc = 0
+    t0 = time.time()
+    lp_x = float(log_post_fn(x))
+    a_coeff = math.sqrt(max(1.0 - beta**2, 1e-12))  # 移至循环外预计算
+    
+    for i in range(N):
+        xi = torch.randn_like(x)
+        y = a_coeff * x + beta * sqrtL * xi
+        lp_y = float(log_post_fn(y))
+        log_acc = min(0.0, lp_y - lp_x)
+        if torch.rand(()) < math.exp(log_acc):
+            x = y
+            lp_x = lp_y
+            acc += 1
+        samples[i] = x.detach().cpu().numpy()
+    
+    return samples, acc / N, time.time() - t0
+
+# ---------------------------------------------------------------------------
+# 3.2 Acceptance-Rate Adaptive pCN (Robbins-Monro)
+# ---------------------------------------------------------------------------
+def pcn_adaptive(x0, log_post_fn, sqrtL, beta0, N, dim, adapt_stop,
+                 target_ar=0.234, adapt_interval=200, gamma_base=0.12):
+    """Acceptance-rate adaptive pCN via Robbins-Monro."""
+    dim_actual = x0.numel()
+    x = x0.clone().flatten()
+    samples = np.empty((N, dim_actual), dtype=np.float64)
+    logb = math.log(beta0)
+    scale = 1.0 / math.sqrt(dim)
+    logb_min = math.log(0.004 * scale)
+    logb_max = math.log(0.90 * scale)
+    acc = 0
+    t0 = time.time()
+    lp_x = float(log_post_fn(x))
+    
+    for i in range(N):
+        b = math.exp(logb)
+        a_coeff = math.sqrt(max(1.0 - b**2, 1e-12))
+        xi = torch.randn_like(x)
+        y = a_coeff * x + b * sqrtL * xi
+        lp_y = float(log_post_fn(y))
+        log_acc = min(0.0, lp_y - lp_x)
+        if torch.rand(()) < math.exp(log_acc):
+            x = y
+            lp_x = lp_y
+            acc += 1
+        samples[i] = x.detach().cpu().numpy()
+        
+        if i < adapt_stop and i > 0 and i % adapt_interval == 0:
+            ar = acc / (i + 1)
+            gamma = gamma_base / math.sqrt(i / adapt_interval + 1.0)
+            logb += gamma * (ar - target_ar)
+            logb = float(np.clip(logb, logb_min, logb_max))
+    
+    return samples, acc / N, time.time() - t0
+
+# ---------------------------------------------------------------------------
+# 3.3 Dual-Signal pCN (acceptance + ESS, logistic switching)
+# ---------------------------------------------------------------------------
+def pcn_dual(x0, log_post_fn, sqrtL, beta0, N, dim, adapt_stop,
+             t_switch=None, target_ar=0.234, adapt_interval=200,
+             gamma_base=0.10, ess_block=2000):
+    """Dual-signal pCN: acceptance + ESS feedback with logistic switching."""
+    dim_actual = x0.numel()
+    x = x0.clone().flatten()
+    samples = np.empty((N, dim_actual), dtype=np.float64)
+    logb = math.log(beta0)
+    scale = 1.0 / math.sqrt(dim)
+    logb_min = math.log(0.004 * scale)
+    logb_max = math.log(0.90 * scale)
+    if t_switch is None:
+        t_switch = int(0.5 * adapt_stop)
+    acc = 0
+    t0 = time.time()
+    lp_x = float(log_post_fn(x))
+    
+    for i in range(N):
+        b = math.exp(logb)
+        a_coeff = math.sqrt(max(1.0 - b**2, 1e-12))
+        xi = torch.randn_like(x)
+        y = a_coeff * x + b * sqrtL * xi
+        lp_y = float(log_post_fn(y))
+        log_acc = min(0.0, lp_y - lp_x)
+        if torch.rand(()) < math.exp(log_acc):
+            x = y
+            lp_x = lp_y
+            acc += 1
+        samples[i] = x.detach().cpu().numpy()
+        
+        if i < adapt_stop and i > 0 and i % adapt_interval == 0:
+            ar = acc / (i + 1)
+            w = smooth_w(i, t_switch)
+            g_acc = ar - target_ar
+            g_ess = 0.0
+            if i > ess_block:
+                blk = samples[i - ess_block:i]
+                g_ess = np.clip((ess_mean(blk) / ess_block) - 0.5, -1.0, 1.0)
+            gamma = gamma_base / math.sqrt(i / adapt_interval + 1.0)
+            logb += gamma * ((1.0 - w) * g_acc + w * g_ess)
+            logb = float(np.clip(logb, logb_min, logb_max))
+    
+    return samples, acc / N, time.time() - t0
+
+# ---------------------------------------------------------------------------
+# 3.4 Adaptive Metropolis — 全张量GPU版 + 修复计数bug
+# ---------------------------------------------------------------------------
+def adaptive_metropolis(x0, log_post_fn, sqrtL, beta0, N, dim, adapt_stop,
+                        sd=None, epsilon=0.05, scale_multiplier=1.0):
+    """
+    Adaptive Metropolis (Haario et al. 2001) — Full tensor GPU optimized version.
+    修复：移除重复EVAL计数，统一由log_post内部计数，保证横向对比公平
+    优化：全程张量运算，消除numpy-torch反复拷贝，协方差与Cholesky均在GPU执行
+    """
+    dim_actual = x0.numel()
+    x = x0.clone().flatten()
+    samples = np.empty((N, dim_actual), dtype=np.float64)
+
+    if sd is None:
+        sd = 2.38 / math.sqrt(dim_actual)
+
+    # 先验对角协方差（张量）
+    diag_init = sqrtL ** 2
+
+    # 初始提议协方差 = 先验对角
+    Sigma_adapt = torch.diag(diag_init)
+
+    # 延迟适应起始点
+    adapt_start = max(10 * dim_actual, 500)
+
+    acc = 0
+    t0 = time.time()
+    # 初始后验值，log_post内部已自动计数，无需额外EVAL.inc
+    lp_x = float(log_post_fn(x))
+
+    # 初始提议Cholesky分解
+    min_var = 1e-4 * torch.max(diag_init).item()
+    Sigma_proposed = scale_multiplier * (Sigma_adapt + epsilon * torch.diag(diag_init))
+    Sigma_proposed = torch.maximum(Sigma_proposed, min_var * torch.eye(dim_actual, device=DEVICE, dtype=DTYPE))
+    Sigma_half = torch.linalg.cholesky(Sigma_proposed)
+
+    # Welford增量协方差更新变量（张量版）
+    mean_so_far = torch.zeros(dim_actual, device=DEVICE, dtype=DTYPE)
+    M_matrix = torch.zeros((dim_actual, dim_actual), device=DEVICE, dtype=DTYPE)
+
+    for i in range(N):
+        # 提议生成
+        z = torch.randn(dim_actual, device=DEVICE, dtype=DTYPE)
+        y = x + sd * (Sigma_half @ z)
+
+        # 后验评估，内部自动计数
+        lp_y = float(log_post_fn(y))
+
+        log_acc = min(0.0, lp_y - lp_x)
+        if torch.rand(()).item() < math.exp(log_acc):
+            x = y
+            lp_x = lp_y
+            acc += 1
+
+        samples[i] = x.detach().cpu().numpy()
+
+        # Welford增量更新
+        if i == 0:
+            mean_so_far = x.clone()
+        else:
+            delta = x - mean_so_far
+            mean_so_far = mean_so_far + delta / (i + 1)
+            delta2 = x - mean_so_far
+            M_matrix = M_matrix + torch.outer(delta, delta2)
+
+        # 协方差适应
+        if i >= adapt_start and i < adapt_stop and (i - adapt_start) % 200 == 0:
+            n_eff = i + 1
+            cov_so_far = M_matrix / (n_eff - 1)
+
+            # 混合经验协方差与先验对角
+            Sigma_adapt = (1 - epsilon) * cov_so_far + epsilon * torch.diag(diag_init)
+            Sigma_proposed = scale_multiplier * Sigma_adapt
+
+            # 特征值地板
+            eigvals = torch.linalg.eigvalsh(Sigma_proposed)
+            min_eig = torch.max(eigvals).item() * 1e-3
+            min_eig = max(min_eig, min_var)
+            Sigma_proposed = Sigma_proposed + min_eig * torch.eye(dim_actual, device=DEVICE, dtype=DTYPE)
+
+            try:
+                Sigma_half = torch.linalg.cholesky(Sigma_proposed)
+            except RuntimeError:
+                # 退化时回退到对角提议
+                diag_vals = torch.maximum(torch.diag(Sigma_proposed), torch.tensor(min_var, device=DEVICE, dtype=DTYPE))
+                Sigma_half = torch.diag(torch.sqrt(diag_vals))
+
+    return samples, acc / N, time.time() - t0
+
+# ---------------------------------------------------------------------------
+# 3.5 MALA (Metropolis-Adjusted Langevin Algorithm) — ROBUST VERSION
+# ---------------------------------------------------------------------------
+def mala_mcmc(x0, log_post_fn, grad_log_post_fn, sqrtL, step_size, N,
+              adapt_stop=None, grad_clip=5.0, drift_clip=1.0):
+    """
+    Metropolis-Adjusted Langevin Algorithm with adaptive step size.
+    Proposal: y = x + h^2 * grad_log_post(x) + h * sqrtL * z
+    """
+    dim_actual = x0.numel()
+    x = x0.clone().flatten()
+    samples = np.empty((N, dim_actual), dtype=np.float64)
+
+    h = step_size
+    target_ar_mala = 0.57  # Optimal acceptance for MALA
+    acc = 0
+    t0 = time.time()
+
+    def clip_grad(g):
+        """Clip gradient to prevent explosion from noisy FD gradients."""
+        gn = torch.norm(g).item()
+        if gn > grad_clip:
+            return g * (grad_clip / max(gn, 1e-30))
+        return g
+
+    # Check if gradient function supports cached_baseline
+    sig = inspect.signature(grad_log_post_fn)
+    supports_cache = 'cached_baseline' in sig.parameters
+
+    lp_x = float(log_post_fn(x))
+    if supports_cache:
+        grad_x = clip_grad(grad_log_post_fn(x, cached_baseline=lp_x))
+    else:
+        grad_x = clip_grad(grad_log_post_fn(x))
+
+    # Adaptive step size tuning
+    h_min = 1e-6
+    h_max = 5.0
+    adapt_interval_mala = 30
+    gamma_mala = 0.15
+    recent_accs = []
+
+    for i in range(N):
+        xi = torch.randn_like(x)
+
+        # Compute drift with clipping
+        drift = h * h * grad_x
+        drift_norm = torch.norm(drift).item()
+        if drift_norm > drift_clip:
+            drift = drift * (drift_clip / max(drift_norm, 1e-30))
+
+        # Forward proposal
+        y = x + drift + h * sqrtL * xi
+
+        lp_y = float(log_post_fn(y))
+        if supports_cache:
+            grad_y = clip_grad(grad_log_post_fn(y, cached_baseline=lp_y))
+        else:
+            grad_y = clip_grad(grad_log_post_fn(y))
+
+        # Reverse proposal drift
+        drift_rev = h * h * grad_y
+        drift_rev_norm = torch.norm(drift_rev).item()
+        if drift_rev_norm > drift_clip:
+            drift_rev = drift_rev * (drift_clip / max(drift_rev_norm, 1e-30))
+
+        # MH correction for asymmetric proposal
+        scale = h * sqrtL + 1e-30
+        diff_fwd = (y - (x + drift)) / scale
+        diff_rev = (x - (y + drift_rev)) / scale
+        log_proposal_ratio = 0.5 * (torch.dot(diff_fwd, diff_fwd) - torch.dot(diff_rev, diff_rev))
+
+        log_acc = min(0.0, lp_y - lp_x + log_proposal_ratio.item())
+        accepted = 0
+        if torch.rand(()) < math.exp(log_acc):
+            x = y
+            lp_x = lp_y
+            grad_x = grad_y
+            acc += 1
+            accepted = 1
+
+        samples[i] = x.detach().cpu().numpy()
+
+        # Adaptive step size during burn-in
+        if adapt_stop is not None and i < adapt_stop:
+            recent_accs.append(accepted)
+            if len(recent_accs) > adapt_interval_mala:
+                recent_accs.pop(0)
+            if len(recent_accs) >= adapt_interval_mala and (i + 1) % adapt_interval_mala == 0:
+                ar_recent = sum(recent_accs) / len(recent_accs)
+                gamma = gamma_mala / math.sqrt((i + 1) / adapt_interval_mala + 1.0)
+                log_h = math.log(h)
+                log_h += gamma * (ar_recent - target_ar_mala)
+                h = math.exp(log_h)
+                h = max(h_min, min(h_max, h))
+
+    return samples, acc / N, time.time() - t0
+
+# === PROBLEM BUILDERS ===
+def build_linear_gaussian(dim, sigma=0.5, cond_level=20.0, snr_level=1.0):
+    """Build a linear-Gaussian inverse problem with controlled spectral structure."""
+    sqrtL = torch.linspace(0.5, 4.0, dim, device=DEVICE, dtype=DTYPE)
+    invL = 1.0 / (sqrtL ** 2)
+    U, _ = torch.linalg.qr(torch.randn(dim, dim, device=DEVICE, dtype=DTYPE))
+    V, _ = torch.linalg.qr(torch.randn(dim, dim, device=DEVICE, dtype=DTYPE))
+    s = torch.linspace(1.0, 1.0 / cond_level, dim, device=DEVICE, dtype=DTYPE)
+    A = U @ torch.diag(s) @ V.T
+    x_true = torch.randn(dim, device=DEVICE, dtype=DTYPE) * 0.5
+    noise_sigma = sigma / snr_level
+    noise = noise_sigma * torch.randn(dim, device=DEVICE, dtype=DTYPE)
+    y = A @ x_true + noise
+    AtA = A.T @ A
+    Aty = A.T @ y
+    Precision = AtA / (noise_sigma ** 2) + torch.diag(invL)
+    b_vec = Aty / (noise_sigma ** 2)
+    x_map = torch.linalg.solve(Precision, b_vec)
+    Sigma_true = torch.inverse(Precision).cpu().numpy()
+    sig_norm = float(torch.norm(A @ x_true).detach().cpu().item())
+    noise_norm = float(torch.norm(noise).detach().cpu().item()) + 1e-30
+    snr_db = 20.0 * math.log10(max(sig_norm / noise_norm, 1e-30))
+    
+    def log_post(x):
+        EVAL.inc(1)
+        quad_like = torch.dot(x, AtA @ x) - 2.0 * torch.dot(x, Aty)
+        log_like = -0.5 * quad_like / (noise_sigma ** 2)
+        quad_prior = torch.dot(x * invL, x)
+        log_prior = -0.5 * quad_prior
+        return log_like + log_prior
+    
+    def grad_log_post(x):
+        g_like = -(AtA @ x - Aty) / (noise_sigma ** 2)
+        g_prior = -invL * x
+        return g_like + g_prior
+    
+    # PyTorch 2.0+ 自动编译加速，低版本自动跳过
+    if COMPILE_AVAILABLE:
+        log_post = torch.compile(log_post, mode="reduce-overhead")
+        grad_log_post = torch.compile(grad_log_post, mode="reduce-overhead")
+    
+    geom = {
+        "cr": float(np.clip(1.0 / cond_level, 0.0, 1.0)),
+        "cond": float(cond_level),
+        "snr_db": float(snr_db),
+    }
+    
+    return {
+        "sqrtL": sqrtL,
+        "invL": invL,
+        "A": A,
+        "singular_vals": s.detach().cpu().numpy(),
+        "AtA": AtA,
+        "Aty": Aty,
+        "sigma": noise_sigma,
+        "x_true": x_true,
+        "x0": x_map,
+        "Sigma_true": Sigma_true,
+        "geom": geom,
+        "log_post": log_post,
+        "grad_log_post": grad_log_post,
+        "dim": dim,
+        "type": "linear",
+    }
+
+def build_cqnlse():
+    """Build the CQNLSE inverse problem (d=2).
+    核心优化：全流程迁移至PyTorch GPU，使用torch.fft加速，支持批量求解
+    梯度计算采用批量前向差分，3次PDE合并为1次批量运算
+    """
+    L_dom = 20
+    N_grid = 64
+    T_final = 0.5
+    nt = 100
+    sigma_obs = 0.02
+    alpha_true = 1.0
+    beta_true = 0.1
+    dt = T_final / nt
+    
+    # 空间网格与波矢（预计算为GPU张量）
+    x_grid_np = np.linspace(-L_dom/2, L_dom/2, N_grid)
+    dx = x_grid_np[1] - x_grid_np[0]
+    k_vec_np = 2 * np.pi * np.fft.fftfreq(N_grid, dx)
+    
+    # 常量全部预加载到GPU，复数单精度提速（MCMC精度足够）
+    x_grid_t = torch.tensor(x_grid_np, device=DEVICE, dtype=DTYPE)
+    lin_phase_t = torch.tensor(np.exp(0.5 * 1j * k_vec_np**2 * dt), device=DEVICE, dtype=torch.complex64)
+    u0_t = (1.5 / torch.cosh(x_grid_t)).to(torch.complex64)
+    
+    def solve_cqnlse_fwd(theta):
+        """
+        CQNLSE正向求解，支持单样本/批量输入
+        Args:
+            theta: 参数张量，shape [2] 或 [B, 2] (alpha, beta)
+        Returns:
+            u: 求解结果，shape [N_grid] 或 [B, N_grid]
+        """
+        if theta.ndim == 1:
+            alpha = theta[0]
+            beta = theta[1]
+            u = u0_t.clone()
+            for _ in range(nt):
+                u = torch.fft.ifft(lin_phase_t * torch.fft.fft(u))
+                u2 = torch.abs(u) ** 2
+                nonlin = torch.exp(-1j * (alpha * u2 + beta * u2**2) * dt)
+                u = u * nonlin
+                u = torch.fft.ifft(lin_phase_t * torch.fft.fft(u))
+            return u
+        else:
+            B = theta.shape[0]
+            alpha = theta[:, 0:1]  # [B,1] 广播适配
+            beta = theta[:, 1:2]   # [B,1] 广播适配
+            u = u0_t.unsqueeze(0).repeat(B, 1)  # [B, N_grid]
+            for _ in range(nt):
+                u = torch.fft.ifft(lin_phase_t.unsqueeze(0) * torch.fft.fft(u, dim=-1), dim=-1)
+                u2 = torch.abs(u) ** 2
+                nonlin = torch.exp(-1j * (alpha * u2 + beta * u2**2) * dt)
+                u = u * nonlin
+                u = torch.fft.ifft(lin_phase_t.unsqueeze(0) * torch.fft.fft(u, dim=-1), dim=-1)
+            return u
+    
+    # 生成观测数据
+    theta_true = torch.tensor([alpha_true, beta_true], device=DEVICE, dtype=DTYPE)
+    u_true_t = solve_cqnlse_fwd(theta_true)
+    noise = sigma_obs * (torch.randn_like(u_true_t) + 1j * torch.randn_like(u_true_t))
+    y_obs_t = u_true_t + noise
+    
+    # 先验参数
+    prior_mean = np.array([0.8, 0.2])
+    prior_std = np.array([0.2, 0.1])
+    prior_mean_t = torch.tensor(prior_mean, device=DEVICE, dtype=DTYPE)
+    prior_std_t = torch.tensor(prior_std, device=DEVICE, dtype=DTYPE)
+    sqrtL_torch = prior_std_t.clone()
+    invL = 1.0 / (prior_std ** 2)
+    
+    def log_post(theta):
+        EVAL.inc(1)
+        try:
+            u_pred = solve_cqnlse_fwd(theta)
+        except Exception:
+            return -1e10
+        diff = u_pred - y_obs_t
+        log_like = -0.5 * torch.sum(torch.abs(diff)**2) / (sigma_obs**2)
+        diff_pr = theta - prior_mean_t
+        log_prior = -0.5 * torch.sum(diff_pr**2 / prior_std_t**2)
+        return float(log_like + log_prior)
+    
+    def grad_log_post_fd(theta, eps=1e-5, cached_baseline=None):
+        """批量前向有限差分梯度，一次求解d+1个点，大幅减少PDE调用次数
+        计数保持与串行版本一致（d+1次评估），保证ESS/eval指标可比
+        """
+        d = theta.numel()
+        # 构造批量参数：基准点 + d个扰动点
+        theta_batch = theta.repeat(d + 1, 1)
+        for j in range(d):
+            theta_batch[j + 1, j] += eps
+        
+        # 一次批量求解所有点，替代d+1次串行求解
+        u_batch = solve_cqnlse_fwd(theta_batch)
+        diff_batch = u_batch - y_obs_t.unsqueeze(0)
+        log_like_batch = -0.5 * torch.sum(torch.abs(diff_batch)**2, dim=-1) / (sigma_obs**2)
+        diff_pr_batch = theta_batch - prior_mean_t.unsqueeze(0)
+        log_prior_batch = -0.5 * torch.sum(diff_pr_batch**2 / prior_std_t.unsqueeze(0)**2, dim=-1)
+        lp_batch = log_like_batch + log_prior_batch
+        
+        EVAL.inc(d + 1)  # 对应d+1次函数评估，计数与串行版本完全一致
+        
+        lp0 = lp_batch[0].item() if cached_baseline is None else cached_baseline
+        g = torch.zeros(d, device=DEVICE, dtype=DTYPE)
+        for j in range(d):
+            g[j] = (lp_batch[j + 1].item() - lp0) / eps
+        return g
+    
+    return {
+        "sqrtL": sqrtL_torch,
+        "invL": invL,
+        "log_post": log_post,
+        "grad_log_post": grad_log_post_fd,
+        "x_true": theta_true,
+        "x0": prior_mean_t.clone(),
+        "dim": 2,
+        "type": "cqnlse",
+        "prior_mean": prior_mean,
+        "prior_std": prior_std,
+        "sigma_obs": sigma_obs,
+        "x_grid": x_grid_np,
+        "y_obs": y_obs_t.cpu().numpy(),
+        "solve_cqnlse": solve_cqnlse_fwd,
+        "geom": {"cond": None, "snr_db": None},
+        "singular_vals": None,
+        "Sigma_true": None,
+    }
+
+# --- Helper: build problem by experiment name ---
+def build_problem_for_exp(exp_name, dim):
+    """Build the appropriate problem for an experiment name and dimension."""
+    set_problem_seed(exp_name, dim)
+    configs = {
+        "BaselineScan": (0.5, 20.0, 1.0),
+        "WellConditioned": (0.5, 2.0, 1.0),
+        "IllConditioned": (0.5, 200.0, 1.0),
+        "LowSNR": (0.5, 20.0, 0.35),
+        "HighSNR": (0.5, 20.0, 2.5),
+    }
+    if exp_name in configs:
+        sigma, kappa, snr = configs[exp_name]
+        return build_linear_gaussian(dim, sigma=sigma, cond_level=kappa, snr_level=snr)
+    elif exp_name == "CQNLSE":
+        return build_cqnlse()
+    else:
+        raise ValueError(f"Unknown experiment: {exp_name}")
+
+# === EXPERIMENT RUNNER (with checkpointing) ===
+def summarize_multichain(chains, burn, x_true_np, Sigma_true):
+    """Compute all diagnostics from multiple chains."""
+    post_chains = [c[burn:] for c in chains]
+    post_all = np.concatenate(post_chains, axis=0)
+    mu_est = post_all.mean(axis=0)
+    cov_est = np.cov(post_all, rowvar=False)
+    err_mu = np.linalg.norm(mu_est - x_true_np) / (np.linalg.norm(x_true_np) + 1e-12)
+    err_cov = 0.0
+    if Sigma_true is not None and cov_est.ndim == 2:
+        err_cov = np.linalg.norm(cov_est - Sigma_true, ord="fro") / \
+                  (np.linalg.norm(Sigma_true, ord="fro") + 1e-12)
+    ess_concat = ess_mean(post_all)
+    ess_chain = [ess_mean(c) for c in post_chains]
+    ess_minchain = float(np.min(ess_chain))
+    rhat = split_rhat(np.stack(post_chains, axis=0))
+    rhat_max = float(np.max(rhat))
+    contract = float(np.trace(cov_est) / (np.trace(Sigma_true) + 1e-12)) \
+               if Sigma_true is not None else 0.0
+    ci = []
+    for j in range(min(2, post_all.shape[1])):
+        q = np.quantile(post_all[:, j], [0.025, 0.5, 0.975])
+        ci.append((float(q[0]), float(q[1]), float(q[2])))
+    return {
+        "mu_est": mu_est,
+        "cov_est": cov_est,
+        "err_mu": float(err_mu),
+        "err_cov": float(err_cov),
+        "ess_concat": float(ess_concat),
+        "ess_minchain": float(ess_minchain),
+        "rhat_max": float(rhat_max),
+        "contract": float(contract),
+        "ci": ci,
+    }
+
+def run_single_method(method, problem, N, burn, adapt_stop, n_chains, init_beta,
+                      exp_name=None, dim=None):
+    """Run a single method on a single problem with multiple chains."""
+    dim_prob = problem["dim"]
+    sqrtL = problem["sqrtL"]
+    log_post = problem["log_post"]
+    grad_log_post = problem["grad_log_post"]
+    x0 = problem["x0"]
+    chains = []
+    times = []
+    ars = []
+    eval_counts = []
+    
+    for c in range(n_chains):
+        if exp_name is not None and dim is not None:
+            set_chain_seed(exp_name, dim, method, c)
+        x_init = x0 + 0.05 * sqrtL * torch.randn(dim_prob, device=DEVICE, dtype=DTYPE)
+        EVAL.reset()
+        
+        if method == "Vanilla pCN":
+            s, ar, t = pcn_vanilla(x_init, log_post, sqrtL, init_beta, N)
+        elif method == "Acceptance-Rate Adaptive pCN":
+            s, ar, t = pcn_adaptive(
+                x_init, log_post, sqrtL, init_beta, N, dim_prob,
+                adapt_stop=adapt_stop,
+                target_ar=DEFAULT_ADAPT["target_ar"],
+                adapt_interval=DEFAULT_ADAPT["adapt_interval"] if problem["type"] == "linear"
+                              else DEFAULT_ADAPT["adapt_interval_cqnlse"],
+                gamma_base=DEFAULT_ADAPT["gamma_base"],
+            )
+        elif method == "Dual-Signal pCN":
+            ai = DEFAULT_ADAPT["adapt_interval"] if problem["type"] == "linear" \
+                 else DEFAULT_ADAPT["adapt_interval_cqnlse"]
+            eb = DEFAULT_ADAPT["ess_block"] if problem["type"] == "linear" \
+                 else DEFAULT_ADAPT["ess_block_cqnlse"]
+            s, ar, t = pcn_dual(
+                x_init, log_post, sqrtL, init_beta, N, dim_prob,
+                adapt_stop=adapt_stop,
+                t_switch=int(DEFAULT_ADAPT["t_switch_frac"] * adapt_stop),
+                target_ar=DEFAULT_ADAPT["target_ar"],
+                adapt_interval=ai,
+                gamma_base=0.10,
+                ess_block=eb,
+            )
+        elif method == "Adaptive Metropolis":
+            s, ar, t = adaptive_metropolis(
+                x_init, log_post, sqrtL, init_beta, N, dim_prob,
+                adapt_stop=adapt_stop,
+            )
+        elif method == "MALA":
+            min_sqrtL = float(sqrtL.min().item())
+            mala_step = 2.0 * min_sqrtL * (max(dim_prob, 2) ** (-1.0/3.0))
+            s, ar, t = mala_mcmc(
+                x_init, log_post, grad_log_post, sqrtL,
+                step_size=mala_step, N=N, adapt_stop=adapt_stop,
+            )
+        else:
+            raise ValueError(f"Unknown method: {method}")
+        
+        chains.append(s)
+        times.append(t)
+        ars.append(ar)
+        eval_counts.append(EVAL.count)
+    
+    return chains, times, ars, eval_counts
+
+def run_single_method_checkpointed(method, problem, N, burn, adapt_stop, n_chains, init_beta,
+                                   exp_name, dim):
+    """Run a single method with checkpoint save/skip support."""
+    manifest = load_manifest()
+    
+    if is_completed(manifest, exp_name, dim, method):
+        logprint(f"  [{method}] dim={dim} -- SKIP (checkpoint found)")
+        name = f"{_safe_name(exp_name)}_d{dim}_{_safe_name(method)}"
+        data = load_checkpoint("lg", name)
+        if data is not None:
+            chains = [data["chains"][i] for i in range(data["chains"].shape[0])]
+            times = list(data["times"])
+            ars = list(data["ars"])
+            eval_counts = list(data["eval_counts"])
+            return chains, times, ars, eval_counts
+    
+    logprint(f"  [{method}] eval_budget={N+1}, N={N}, burn={burn}")
+    chains, times, ars, eval_counts = run_single_method(
+        method, problem, N, burn, adapt_stop, n_chains, init_beta,
+        exp_name=exp_name, dim=dim
+    )
+    
+    name = f"{_safe_name(exp_name)}_d{dim}_{_safe_name(method)}"
+    chains_stacked = np.stack(chains, axis=0)
+    save_checkpoint("lg", name,
+                    chains=chains_stacked,
+                    ars=np.array(ars),
+                    times=np.array(times),
+                    eval_counts=np.array(eval_counts),
+                    burn=np.array(burn),
+                    method=np.array(method),
+                    exp=np.array(exp_name),
+                    dim=np.array(dim))
+    
+    register_completed(manifest, "completed",
+                       exp=exp_name, dim=dim, method=method,
+                       timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+                       file=f"lg/{name}.npz")
+    
+    return chains, times, ars, eval_counts
+
+def run_experiment(exp_name, dim_list, n_chains=N_CHAINS, eval_budget=EVAL_BUDGET_LG):
+    """Run all methods on an experiment with checkpointing."""
+    logprint("\n" + "=" * 92)
+    logprint(f"Experiment: {exp_name}")
+    logprint("=" * 92)
+    results = []
+    
+    for dim in dim_list:
+        prob = build_problem_for_exp(exp_name, dim)
+        init_beta = 0.2 / math.sqrt(prob["dim"])
+        N = eval_budget - 1
+        burn_frac = DEFAULT_ADAPT["burn_frac"] if prob["type"] == "linear" \
+                    else DEFAULT_ADAPT["burn_frac_cqnlse"]
+        burn = int(N * burn_frac)
+        adapt_stop = burn
+        logprint(f"\n--- dim={prob['dim']} | N={N} | burn={burn} ---")
+        
+        for method in METHODS:
+            chains, times, ars, eval_counts = run_single_method_checkpointed(
+                method, prob, N, burn, adapt_stop, n_chains, init_beta,
+                exp_name=exp_name, dim=prob["dim"]
+            )
+            summary = summarize_multichain(
+                chains, burn, prob["x_true"].cpu().numpy(),
+                prob.get("Sigma_true")
+            )
+            ess_val = summary["ess_concat"]
+            ess_s = ess_val / max(np.mean(times), 1e-12)
+            ess_eval = ess_val / max(np.mean(eval_counts), 1e-12)
+            entry = {
+                "exp": exp_name,
+                "dim": prob["dim"],
+                "method": method,
+                "AR": float(np.mean(ars)),
+                "AR_std": float(np.std(ars)),
+                "ESS_concat": float(ess_val),
+                "ESS_minchain": float(summary["ess_minchain"]),
+                "ESS_s": float(ess_s),
+                "ESS_eval": float(ess_eval),
+                "Rhat": float(summary["rhat_max"]),
+                "Err_mu": float(summary["err_mu"]),
+                "Err_cov": float(summary["err_cov"]),
+                "Contract": float(summary["contract"]),
+                "Time": float(np.mean(times)),
+                "Time_std": float(np.std(times)),
+                "burn": int(burn),
+                "eval_mean": float(np.mean(eval_counts)),
+                "ci": summary["ci"],
+                "chains": chains,
+                "singular_vals": prob.get("singular_vals"),
+                "prior_std": prob["sqrtL"].detach().cpu().numpy() if isinstance(prob["sqrtL"], torch.Tensor) else prob["sqrtL"],
+            }
+            results.append(entry)
+            logprint(f"    AR={entry['AR']:.3f} ESS={ess_val:.1f} "
+                     f"ESS/eval={ess_eval:.6f} Rhat={entry['Rhat']:.3f} "
+                     f"Time={entry['Time']:.2f}s")
+    
+    return results
+
+# === SENSITIVITY ANALYSIS (with checkpointing) ===
+def run_sensitivity_checkpointed(exp_name="IllConditioned", dim=80, base_eval_budget=EVAL_BUDGET_LG, n_chains=4):
+    """
+    Sensitivity analysis for adaptive pCN with per-parameter-value checkpointing.
+    Varies: target_ar, adapt_interval, burn_frac.
+    """
+    logprint("\n" + "=" * 92)
+    logprint(f"Sensitivity Analysis: {exp_name}")
+    logprint("=" * 92)
+    
+    prob = build_problem_for_exp(exp_name, dim)
+    sqrtL = prob["sqrtL"]
+    log_post = prob["log_post"]
+    x0 = prob["x0"]
+    init_beta = 0.2 / math.sqrt(dim)
+    N = base_eval_budget - 1
+    
+    sens_results = {"target_ar": [], "adapt_interval": [], "burn_frac": []}
+    manifest = load_manifest()
+    
+    # --- Vary target_ar ---
+    target_ar_values = [0.10, 0.15, 0.234, 0.30, 0.40, 0.50]
+    for tar in target_ar_values:
+        param = "target_ar"
+        ckpt_name = f"{param}_{tar}"
+        ckpt_data = load_checkpoint("sensitivity", ckpt_name)
+        if ckpt_data is not None:
+            logprint(f"  [{param}={tar}] -- SKIP (checkpoint found)")
+            ess_val = float(ckpt_data["ess"])
+            ess_s = float(ckpt_data["ess_s"])
+            rhat_val = float(ckpt_data["rhat"])
+            ar_val = float(ckpt_data["ar"])
+        else:
+            logprint(f"  [{param}={tar}] running...")
+            chains_list = []
+            times_list = []
+            evals_list = []
+            ars_list = []
+            burn = int(N * 0.30)
+            for c in range(n_chains):
+                set_chain_seed(f"sens_{param}", dim, f"target_ar_{tar}", c)
+                x_init = x0 + 0.05 * sqrtL * torch.randn(dim, device=DEVICE, dtype=DTYPE)
+                EVAL.reset()
+                s, ar, t = pcn_adaptive(
+                    x_init, log_post, sqrtL, init_beta, N, dim,
+                    adapt_stop=burn,
+                    target_ar=tar,
+                    adapt_interval=200,
+                )
+                chains_list.append(s)
+                times_list.append(t)
+                evals_list.append(EVAL.count)
+                ars_list.append(ar)
+            post_all = np.concatenate([ch[burn:] for ch in chains_list], axis=0)
+            ess_val = ess_mean(post_all)
+            ess_s = ess_val / max(np.mean(times_list), 1e-12)
+            rhat_val = float(np.max(split_rhat(
+                np.stack([ch[burn:] for ch in chains_list], axis=0)
+            )))
+            ar_val = float(np.mean(ars_list))
+            save_checkpoint("sensitivity", ckpt_name,
+                            chains=np.stack(chains_list, axis=0),
+                            times=np.array(times_list),
+                            evals=np.array(evals_list),
+                            burn=np.array(burn),
+                            ess=np.array(ess_val),
+                            ess_s=np.array(ess_s),
+                            rhat=np.array(rhat_val),
+                            ar=np.array(ar_val),
+                            param=np.array(param),
+                            value=np.array(tar))
+            register_completed(manifest, "sensitivity",
+                               key=ckpt_name, param=param, value=tar,
+                               timestamp=time.strftime("%Y-%m-%d %H:%M:%S"))
+        sens_results["target_ar"].append({
+            "target_ar": tar,
+            "ESS": ess_val,
+            "ESS_s": ess_s,
+            "Rhat": rhat_val,
+            "AR": ar_val,
+        })
+        logprint(f"    ESS={ess_val:.1f} Rhat={rhat_val:.3f} AR={ar_val:.3f}")
+    
+    # --- Vary adapt_interval ---
+    interval_values = [50, 100, 200, 400, 800]
+    for interv in interval_values:
+        param = "adapt_interval"
+        ckpt_name = f"{param}_{interv}"
+        ckpt_data = load_checkpoint("sensitivity", ckpt_name)
+        if ckpt_data is not None:
+            logprint(f"  [{param}={interv}] -- SKIP (checkpoint found)")
+            ess_val = float(ckpt_data["ess"])
+            ess_s = float(ckpt_data["ess_s"])
+            rhat_val = float(ckpt_data["rhat"])
+            ar_val = float(ckpt_data.get("ar", 0.0))
+        else:
+            logprint(f"  [{param}={interv}] running...")
+            chains_list = []
+            times_list = []
+            ars_list = []
+            burn = int(N * 0.30)
+            for c in range(n_chains):
+                set_chain_seed(f"sens_{param}", dim, f"interval_{interv}", c)
+                x_init = x0 + 0.05 * sqrtL * torch.randn(dim, device=DEVICE, dtype=DTYPE)
+                EVAL.reset()
+                s, ar, t = pcn_adaptive(
+                    x_init, log_post, sqrtL, init_beta, N, dim,
+                    adapt_stop=burn,
+                    target_ar=0.234,
+                    adapt_interval=interv,
+                )
+                chains_list.append(s)
+                times_list.append(t)
+                ars_list.append(ar)
+            post_all = np.concatenate([ch[burn:] for ch in chains_list], axis=0)
+            ess_val = ess_mean(post_all)
+            ess_s = ess_val / max(np.mean(times_list), 1e-12)
+            rhat_val = float(np.max(split_rhat(
+                np.stack([ch[burn:] for ch in chains_list], axis=0)
+            )))
+            ar_val = float(np.mean(ars_list))
+            save_checkpoint("sensitivity", ckpt_name,
+                            chains=np.stack(chains_list, axis=0),
+                            times=np.array(times_list),
+                            burn=np.array(burn),
+                            ess=np.array(ess_val),
+                            ess_s=np.array(ess_s),
+                            rhat=np.array(rhat_val),
+                            ar=np.array(ar_val),
+                            param=np.array(param),
+                            value=np.array(interv))
+            register_completed(manifest, "sensitivity",
+                               key=ckpt_name, param=param, value=interv,
+                               timestamp=time.strftime("%Y-%m-%d %H:%M:%S"))
+        sens_results["adapt_interval"].append({
+            "adapt_interval": interv,
+            "ESS": ess_val,
+            "ESS_s": ess_s,
+            "Rhat": rhat_val,
+            "AR": ar_val,
+        })
+        logprint(f"    ESS={ess_val:.1f} Rhat={rhat_val:.3f} AR={ar_val:.3f}")
+    
+    # --- Vary burn_frac ---
+    burn_frac_values = [0.05, 0.10, 0.15, 0.25, 0.30, 0.40, 0.50]
+    for bf in burn_frac_values:
+        param = "burn_frac"
+        ckpt_name = f"{param}_{bf}"
+        ckpt_data = load_checkpoint("sensitivity", ckpt_name)
+        if ckpt_data is not None:
+            logprint(f"  [{param}={bf}] -- SKIP (checkpoint found)")
+            ess_val = float(ckpt_data["ess"])
+            ess_s = float(ckpt_data["ess_s"])
+            rhat_val = float(ckpt_data["rhat"])
+            ar_val = float(ckpt_data.get("ar", 0.0))
+            burn = int(ckpt_data["burn"])
+        else:
+            logprint(f"  [{param}={bf}] running...")
+            chains_list = []
+            times_list = []
+            ars_list = []
+            burn = int(N * bf)
+            for c in range(n_chains):
+                set_chain_seed(f"sens_{param}", dim, f"burnfrac_{bf}", c)
+                x_init = x0 + 0.05 * sqrtL * torch.randn(dim, device=DEVICE, dtype=DTYPE)
+                EVAL.reset()
+                s, ar, t = pcn_adaptive(
+                    x_init, log_post, sqrtL, init_beta, N, dim,
+                    adapt_stop=burn,
+                    target_ar=0.234,
+                    adapt_interval=200,
+                )
+                chains_list.append(s)
+                times_list.append(t)
+                ars_list.append(ar)
+            post_all = np.concatenate([ch[burn:] for ch in chains_list], axis=0)
+            ess_val = ess_mean(post_all)
+            ess_s = ess_val / max(np.mean(times_list), 1e-12)
+            rhat_val = float(np.max(split_rhat(
+                np.stack([ch[burn:] for ch in chains_list], axis=0)
+            )))
+            ar_val = float(np.mean(ars_list))
+            save_checkpoint("sensitivity", ckpt_name,
+                            chains=np.stack(chains_list, axis=0),
+                            times=np.array(times_list),
+                            burn=np.array(burn),
+                            ess=np.array(ess_val),
+                            ess_s=np.array(ess_s),
+                            rhat=np.array(rhat_val),
+                            ar=np.array(ar_val),
+                            param=np.array(param),
+                            value=np.array(bf))
+            register_completed(manifest, "sensitivity",
+                               key=ckpt_name, param=param, value=bf,
+                               timestamp=time.strftime("%Y-%m-%d %H:%M:%S"))
+        sens_results["burn_frac"].append({
+            "burn_frac": bf,
+            "ESS": ess_val,
+            "ESS_s": ess_s,
+            "Rhat": rhat_val,
+            "burn": burn,
+            "AR": ar_val,
+        })
+        logprint(f"    ESS={ess_val:.1f} Rhat={rhat_val:.3f} AR={ar_val:.3f}")
+    
+    return sens_results
+
+# === MULTI-SEED UNCERTAINTY QUANTIFICATION (with checkpointing) ===
+def run_multi_seed_checkpointed(exp_name="IllConditioned", dim=80, n_seeds=5,
+                                eval_budget=EVAL_BUDGET_LG, n_chains=4):
+    """Run a method with multiple random seeds to quantify variability.
+    Each (method, seed) pair is checkpointed individually.
+    """
+    logprint("\n" + "=" * 92)
+    logprint(f"Multi-Seed Uncertainty Quantification: {exp_name}")
+    logprint("=" * 92)
+    
+    # Build problem deterministically
+    prob = build_problem_for_exp(exp_name, dim)
+    init_beta = 0.2 / math.sqrt(dim)
+    N = eval_budget - 1
+    burn_frac = DEFAULT_ADAPT["burn_frac"] if prob["type"] == "linear" \
+                else DEFAULT_ADAPT["burn_frac_cqnlse"]
+    burn = int(N * burn_frac)
+    adapt_stop = burn
+    manifest = load_manifest()
+    all_seed_data = {}  # method -> list of per-seed results
+    
+    for method in METHODS:
+        all_seed_data[method] = []
+        for seed in range(n_seeds):
+            ckpt_name = f"{_safe_name(method)}_seed{seed}"
+            ckpt_data = load_checkpoint("multiseed", ckpt_name)
+            if ckpt_data is not None:
+                logprint(f"  [{method}] seed={seed} -- SKIP (checkpoint found)")
+                chains = [ckpt_data["chains"][i] for i in range(ckpt_data["chains"].shape[0])]
+                times = list(ckpt_data["times"])
+                ars = list(ckpt_data["ars"])
+                eval_counts = list(ckpt_data["eval_counts"])
+            else:
+                logprint(f"  [{method}] seed={seed} running...")
+                # exp_name includes seed so that set_chain_seed() inside
+                # run_single_method produces different chain seeds per seed
+                # iteration (otherwise all seeds would be identical).
+                chains, times, ars, eval_counts = run_single_method(
+                    method, prob, N, burn, adapt_stop, n_chains, init_beta,
+                    exp_name=f"multiseed_{method}_s{seed}",
+                    dim=dim
+                )
+                # Save checkpoint
+                save_checkpoint("multiseed", ckpt_name,
+                                chains=np.stack(chains, axis=0),
+                                times=np.array(times),
+                                ars=np.array(ars),
+                                eval_counts=np.array(eval_counts),
+                                burn=np.array(burn),
+                                method=np.array(method),
+                                seed=np.array(seed))
+                register_completed(manifest, "multiseed",
+                                   method=method, seed=seed,
+                                   timestamp=time.strftime("%Y-%m-%d %H:%M:%S"))
+            # Compute summary for this seed
+            summary = summarize_multichain(
+                chains, burn, prob["x_true"].cpu().numpy(),
+                prob.get("Sigma_true")
+            )
+            ess_val = summary["ess_concat"]
+            all_seed_data[method].append({
+                "ess": ess_val,
+                "ess_s": ess_val / max(np.mean(times), 1e-12),
+                "ess_eval": ess_val / max(np.mean(eval_counts), 1e-12),
+                "rhat": summary["rhat_max"],
+                "ar": np.mean(ars),
+                "time": np.mean(times),
+                "err_mu": summary["err_mu"],
+            })
+            logprint(f"    ESS={ess_val:.1f} Rhat={summary['rhat_max']:.3f}")
+    
+    # Aggregate across seeds
+    unc_results = []
+    for method in METHODS:
+        data = all_seed_data[method]
+        unc_results.append({
+            "method": method,
+            "ESS_mean": np.mean([d["ess"] for d in data]),
+            "ESS_std": np.std([d["ess"] for d in data]),
+            "ESS_s_mean": np.mean([d["ess_s"] for d in data]),
+            "ESS_s_std": np.std([d["ess_s"] for d in data]),
+            "ESS_eval_mean": np.mean([d["ess_eval"] for d in data]),
+            "ESS_eval_std": np.std([d["ess_eval"] for d in data]),
+            "Rhat_mean": np.mean([d["rhat"] for d in data]),
+            "Rhat_std": np.std([d["rhat"] for d in data]),
+            "AR_mean": np.mean([d["ar"] for d in data]),
+            "AR_std": np.std([d["ar"] for d in data]),
+            "Time_mean": np.mean([d["time"] for d in data]),
+            "Time_std": np.std([d["time"] for d in data]),
+            "Err_mu_mean": np.mean([d["err_mu"] for d in data]),
+            "Err_mu_std": np.std([d["err_mu"] for d in data]),
+        })
+        logprint(f"  [{method}] ESS={unc_results[-1]['ESS_mean']:.1f}+/-{unc_results[-1]['ESS_std']:.1f} "
+                 f"Rhat={unc_results[-1]['Rhat_mean']:.3f}+/-{unc_results[-1]['Rhat_std']:.3f}")
+    
+    return unc_results
+
+# === MAIN EXECUTION (with checkpoint/resume) ===
+# Run all cells above first, then execute this cell.
+# Interrupt at any point — re-running will skip completed units.
+
+def run_cqnlse_checkpointed():
+    """Run CQNLSE experiment with per-method checkpointing."""
+    logprint("\n" + "#" * 92)
+    logprint("# CQNLSE EXPERIMENT")
+    logprint("#" * 92)
+    
+    set_problem_seed("CQNLSE", 2)
+    prob_cqnlse = build_cqnlse()
+    dim_c = 2
+    N_c = EVAL_BUDGET_CQNLSE - 1
+    burn_c = int(N_c * DEFAULT_ADAPT["burn_frac_cqnlse"])
+    adapt_stop_c = burn_c
+    init_beta_c = 0.5 / math.sqrt(dim_c)
+    
+    manifest = load_manifest()
+    cqnlse_chains_all = {}
+    cqnlse_samples = []
+    
+    for method in METHODS:
+        ckpt_name = f"CQNLSE_d2_{_safe_name(method)}"
+        if is_cqnlse_completed(manifest, method):
+            logprint(f"\n  [{method}] CQNLSE -- SKIP (checkpoint found)")
+            data = load_checkpoint("cqnlse", ckpt_name)
+            chains = [data["chains"][i] for i in range(data["chains"].shape[0])]
+            times = list(data["times"])
+            ars = list(data["ars"])
+            eval_counts = list(data["eval_counts"])
+        else:
+            logprint(f"\n  [{method}] CQNLSE: N={N_c}, burn={burn_c}")
+            chains, times, ars, eval_counts = run_single_method(
+                method, prob_cqnlse, N_c, burn_c, adapt_stop_c, N_CHAINS, init_beta_c,
+                exp_name="CQNLSE", dim=dim_c
+            )
+            # Save checkpoint
+            save_checkpoint("cqnlse", ckpt_name,
+                            chains=np.stack(chains, axis=0),
+                            times=np.array(times),
+                            ars=np.array(ars),
+                            eval_counts=np.array(eval_counts),
+                            burn=np.array(burn_c),
+                            method=np.array(method),
+                            exp=np.array("CQNLSE"),
+                            dim=np.array(dim_c))
+            register_completed(manifest, "cqnlse",
+                               method=method,
+                               timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+                               file=f"cqnlse/{ckpt_name}.npz")
+        
+        cqnlse_chains_all[method] = chains
+        cqnlse_samples.append(chains[0])
+        
+        # Compute diagnostics
+        post_all = np.concatenate([ch[burn_c:] for ch in chains], axis=0)
+        ess_val = ess_mean(post_all)
+        rhat_val = split_rhat(np.stack([ch[burn_c:] for ch in chains], axis=0))
+        a_est = post_all[:, 0].mean()
+        b_est = post_all[:, 1].mean()
+        logprint(f"    ESS={ess_val:.1f} Rhat_max={float(np.max(rhat_val)):.3f} "
+                 f"alpha_est={a_est:.4f} beta_est={b_est:.4f} "
+                 f"Time={np.mean(times):.2f}s Eval_mean={np.mean(eval_counts):.0f}")
+    
+    logprint("\n  [OK] CQNLSE experiment done.")
+    return cqnlse_chains_all, cqnlse_samples, prob_cqnlse, burn_c
+
+# =============================================================================
+# PART A: Linear-Gaussian Experiments
+# =============================================================================
+t_global0 = time.time()
+logprint("\n" + "#" * 92)
+logprint("# PART A: LINEAR-GAUSSIAN EXPERIMENTS")
+logprint("#" * 92)
+
+baseline_dims = list(range(10, 101, 10))
+fixed_dim = 80
+
+# Exp 0: BaselineScan (dims 10-100)
+res0 = run_experiment("BaselineScan", dim_list=baseline_dims, eval_budget=EVAL_BUDGET_LG)
+
+# Exp 1-4: Fixed-dim regimes
+regime_results = {}
+for exp_name in ["WellConditioned", "IllConditioned", "LowSNR", "HighSNR"]:
+    regime_results[exp_name] = run_experiment(
+        exp_name, dim_list=[fixed_dim], eval_budget=EVAL_BUDGET_LG
+    )
+
+all_lg_results = res0 + sum(regime_results.values(), [])
+
+# Save linear-Gaussian summary (no chains — those are in checkpoints)
+jsonl_path = os.path.join(OUTDIR, "results_lg.jsonl")
+with open(jsonl_path, "w", encoding="utf-8") as f: pass
+for r in all_lg_results:
+    r_small = {k: v for k, v in r.items() if k not in ["chains", "singular_vals", "prior_std"]}
+    with open(jsonl_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(r_small) + "\n")
+
+logprint(f"\n  [OK] Linear-Gaussian done. Summary saved to {jsonl_path}")
+
+# =============================================================================
+# PART B: CQNLSE Experiment
+# =============================================================================
+cqnlse_chains_all, cqnlse_samples, prob_cqnlse, burn_c = run_cqnlse_checkpointed()
+
+# =============================================================================
+# PART C: Sensitivity Analysis (IllConditioned)
+# =============================================================================
+sens_results = run_sensitivity_checkpointed(
+    exp_name="IllConditioned",
+    dim=fixed_dim,
+    base_eval_budget=EVAL_BUDGET_LG,
+    n_chains=N_CHAINS
+)
+logprint("\n  [OK] Sensitivity analysis done.")
+
+# =============================================================================
+# PART D: Multi-Seed Uncertainty (IllConditioned)
+# =============================================================================
+N_SEEDS = 5
+unc_results = run_multi_seed_checkpointed(
+    exp_name="IllConditioned",
+    dim=fixed_dim,
+    n_seeds=N_SEEDS,
+    eval_budget=EVAL_BUDGET_LG,
+    n_chains=N_CHAINS
+)
+logprint("\n  [OK] Uncertainty quantification done.")
+
+# =============================================================================
+# PART E: Save config
+# =============================================================================
+config = {
+    "seed": SEED,
+    "dtype": str(DTYPE),
+    "device": str(DEVICE),
+    "methods": METHODS,
+    "eval_budget_lg": EVAL_BUDGET_LG,
+    "eval_budget_cqnlse": EVAL_BUDGET_CQNLSE,
+    "n_chains": N_CHAINS,
+    "baseline_dims": baseline_dims,
+    "fixed_dim": fixed_dim,
+    "default_adapt": DEFAULT_ADAPT,
+    "n_seeds_uncertainty": N_SEEDS,
+    "torch_compile_enabled": COMPILE_AVAILABLE,
+}
+with open(os.path.join(OUTDIR, "config_used.json"), "w", encoding="utf-8") as f:
+    json.dump(config, f, indent=2)
+
+# =============================================================================
+# END
+# =============================================================================
+t_global1 = time.time()
+logprint("\n" + "=" * 90)
+logprint(f"COMPLETE -- Total runtime: {t_global1 - t_global0:.2f} seconds")
+logprint("=" * 90)
+logprint(f"\nOutput folder: {OUTDIR}/")
+logprint(f"  Checkpoints: {CKPT_DIR}/ (manifest.json + .npz files)")
+logprint(f"  Summary: results_lg.jsonl, config_used.json")
+logprint(f"\nUse analysis_plotting.ipynb to load checkpoints and generate figures/tables.")
