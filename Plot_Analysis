@@ -1,0 +1,1379 @@
+# === IMPORTS & CONFIGURATION ===
+
+import os
+import math
+import time
+import json
+import hashlib
+import numpy as np
+import torch
+import matplotlib
+# Do NOT force Agg backend — let notebook use inline rendering
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
+
+from tabulate import tabulate
+
+# --- Device (needed for problem reconstruction) ---
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DTYPE = torch.float64
+torch.set_default_dtype(DTYPE)
+
+SEED = 42
+
+# --- Output & Checkpoint directories ---
+OUTDIR = "unified_results0625"
+CKPT_DIR = os.path.join(OUTDIR, "checkpoints")
+
+# --- Method registry ---
+METHODS = [
+    "Vanilla pCN",
+    "Acceptance-Rate Adaptive pCN",
+    "Dual-Signal pCN",
+    "Adaptive Metropolis",
+    "MALA",
+]
+
+METHOD_COLORS = {
+    "Vanilla pCN":                  "#4D4D4D",
+    "Acceptance-Rate Adaptive pCN": "#B2182B",
+    "Dual-Signal pCN":              "#1A9850",
+    "Adaptive Metropolis":          "#35978F",
+    "MALA":                         "#8C510A",
+}
+
+MARKERS = {
+    "Vanilla pCN": "o",
+    "Acceptance-Rate Adaptive pCN": "s",
+    "Dual-Signal pCN": "^",
+    "Adaptive Metropolis": "D",
+    "MALA": "v",
+}
+
+LINESTYLES = {
+    "Vanilla pCN": "-",
+    "Acceptance-Rate Adaptive pCN": "--",
+    "Dual-Signal pCN": "-.",
+    "Adaptive Metropolis": ":",
+    "MALA": (0, (3, 1, 1, 1)),
+}
+
+DEFAULT_ADAPT = {
+    "target_ar": 0.234,
+    "adapt_interval": 200,
+    "adapt_interval_cqnlse": 50,
+    "burn_frac": 0.30,
+    "burn_frac_cqnlse": 0.25,
+    "gamma_base": 0.12,
+    "t_switch_frac": 0.5,
+    "ess_block": 2000,
+    "ess_block_cqnlse": 500,
+}
+
+EVAL_BUDGET_LG = 20000
+EVAL_BUDGET_CQNLSE = 6000
+N_CHAINS = 4
+
+# --- Plot style ---
+plt.rcParams.update({
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
+    "font.size": 9,
+    "axes.titlesize": 10,
+    "axes.labelsize": 9,
+    "legend.fontsize": 8,
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+    "axes.linewidth": 0.7,
+    "grid.linewidth": 0.5,
+    "grid.alpha": 0.18,
+    "grid.linestyle": "--",
+    "lines.linewidth": 1.4,
+    "figure.dpi": 260,
+    "savefig.dpi": 400,
+    "savefig.transparent": False,
+    "figure.constrained_layout.use": True,
+    "savefig.bbox": "tight",
+})
+
+os.makedirs(OUTDIR, exist_ok=True)
+
+def logprint(msg: str):
+    print(msg)
+    with open(os.path.join(OUTDIR, "analysis_log.txt"), "a", encoding="utf-8") as f:
+        f.write(msg + "\n")
+
+# Reset log
+with open(os.path.join(OUTDIR, "analysis_log.txt"), "w", encoding="utf-8") as f:
+    pass
+
+logprint("Analysis notebook initialized.")
+
+
+# === UTILITY FUNCTIONS ===
+
+
+def ess_1d(series):
+    series = np.asarray(series, dtype=np.float64)
+    n = len(series)
+    if n < 30:
+        return float(max(1, n))
+    if np.allclose(series, series[0], atol=1e-12):
+        return 1.0
+    series = series - series.mean()
+    # FFT-based autocorrelation: O(n log n) instead of O(n^2)
+    n_fft = 1
+    while n_fft < 2 * n:
+        n_fft *= 2
+    fft_s = np.fft.rfft(series, n=n_fft)
+    ac = np.fft.irfft(fft_s * np.conj(fft_s))[:n]
+    ac = ac / (ac[0] + 1e-30)
+    cutoff = min(n, 4000)
+    for k in range(1, cutoff):
+        if ac[k] < 0:
+            cutoff = k
+            break
+    tau = 1.0 + 2.0 * np.sum(ac[1:cutoff])
+    ess = n / max(tau, 1e-12)
+    return float(max(1.0, min(n, ess)))
+
+
+def ess_mean(samples):
+    samples = np.asarray(samples, dtype=np.float64)
+    d = samples.shape[1]
+    return float(np.mean([ess_1d(samples[:, i]) for i in range(d)]))
+
+
+def ess_min(samples):
+    samples = np.asarray(samples, dtype=np.float64)
+    d = samples.shape[1]
+    return float(np.min([ess_1d(samples[:, i]) for i in range(d)]))
+
+
+def split_rhat(chains):
+    chains = np.asarray(chains, dtype=np.float64)
+    m, n, d = chains.shape
+    if n < 50:
+        return np.ones(d)
+    n2 = n // 2
+    split = np.concatenate([chains[:, :n2, :], chains[:, n2:2*n2, :]], axis=0)
+    chain_means = split.mean(axis=1)
+    chain_vars = split.var(axis=1, ddof=1)
+    W = chain_vars.mean(axis=0)
+    B = n2 * chain_means.var(axis=0, ddof=1)
+    var_hat = ((n2 - 1) / n2) * W + (1 / n2) * B
+    Rhat = np.sqrt(var_hat / np.maximum(W, 1e-14))
+    return Rhat
+
+
+def autocorr(x, max_lag=200):
+    x = np.asarray(x, dtype=np.float64)
+    x = x - x.mean()
+    n = len(x)
+    if n < 5:
+        return np.zeros(max_lag)
+    # FFT-based autocorrelation: O(n log n)
+    n_fft = 1
+    while n_fft < 2 * n:
+        n_fft *= 2
+    fft_x = np.fft.rfft(x, n=n_fft)
+    ac_full = np.fft.irfft(fft_x * np.conj(fft_x))[:n]
+    ac = ac_full / (ac_full[0] + 1e-30)
+    return ac[:max_lag]
+
+
+def credible_interval(samples, ci=0.95):
+    alpha = 1 - ci
+    lower = np.percentile(samples, 100 * alpha / 2, axis=0)
+    upper = np.percentile(samples, 100 * (1 - alpha / 2), axis=0)
+    return np.column_stack([lower, upper])
+
+
+def summarize_multichain(chains, burn, x_true_np, Sigma_true):
+    """Compute all diagnostics from multiple chains."""
+    post_chains = [c[burn:] for c in chains]
+    post_all = np.concatenate(post_chains, axis=0)
+
+    mu_est = post_all.mean(axis=0)
+    cov_est = np.cov(post_all, rowvar=False)
+
+    err_mu = np.linalg.norm(mu_est - x_true_np) / (np.linalg.norm(x_true_np) + 1e-12)
+    err_cov = 0.0
+    if Sigma_true is not None and cov_est.ndim == 2:
+        err_cov = np.linalg.norm(cov_est - Sigma_true, ord="fro") / \
+                  (np.linalg.norm(Sigma_true, ord="fro") + 1e-12)
+
+    ess_concat = ess_mean(post_all)
+    ess_chain = [ess_mean(c) for c in post_chains]
+    ess_minchain = float(np.min(ess_chain))
+
+    rhat = split_rhat(np.stack(post_chains, axis=0))
+    rhat_max = float(np.max(rhat))
+
+    contract = float(np.trace(cov_est) / (np.trace(Sigma_true) + 1e-12)) \
+        if Sigma_true is not None else 0.0
+
+    ci = []
+    for j in range(min(2, post_all.shape[1])):
+        q = np.quantile(post_all[:, j], [0.025, 0.5, 0.975])
+        ci.append((float(q[0]), float(q[1]), float(q[2])))
+
+    return {
+        "mu_est": mu_est,
+        "cov_est": cov_est,
+        "err_mu": float(err_mu),
+        "err_cov": float(err_cov),
+        "ess_concat": float(ess_concat),
+        "ess_minchain": float(ess_minchain),
+        "rhat_max": float(rhat_max),
+        "contract": float(contract),
+        "ci": ci,
+    }
+
+
+def _seed_from_key(key: str, base_seed: int = SEED) -> int:
+    """Deterministic seed from a string key."""
+    h = int(hashlib.md5(f"{key}_{base_seed}".encode()).hexdigest()[:8], 16)
+    return h % (2**31)
+
+
+def _safe_name(name: str) -> str:
+    """Convert method/exp name to filesystem-safe string."""
+    return name.replace(" ", "_").replace("-", "_").replace(".", "_")
+
+
+# === PROBLEM BUILDERS (for reconstructing problem data in analysis) ===
+
+
+def set_problem_seed(exp_name: str, dim: int, base_seed: int = SEED):
+    """Set deterministic seeds for problem construction."""
+    seed = _seed_from_key(f"problem_{exp_name}_{dim}", base_seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    return seed
+
+
+def build_linear_gaussian(dim, sigma=0.5, cond_level=20.0, snr_level=1.0):
+    """Build a linear-Gaussian inverse problem with controlled spectral structure."""
+    sqrtL = torch.linspace(0.5, 4.0, dim, device=DEVICE, dtype=DTYPE)
+    invL = 1.0 / (sqrtL ** 2)
+
+    U, _ = torch.linalg.qr(torch.randn(dim, dim, device=DEVICE, dtype=DTYPE))
+    V, _ = torch.linalg.qr(torch.randn(dim, dim, device=DEVICE, dtype=DTYPE))
+    s = torch.linspace(1.0, 1.0 / cond_level, dim, device=DEVICE, dtype=DTYPE)
+    A = U @ torch.diag(s) @ V.T
+
+    x_true = torch.randn(dim, device=DEVICE, dtype=DTYPE) * 0.5
+    noise_sigma = sigma / snr_level
+    noise = noise_sigma * torch.randn(dim, device=DEVICE, dtype=DTYPE)
+    y = A @ x_true + noise
+
+    AtA = A.T @ A
+    Aty = A.T @ y
+    Precision = AtA / (noise_sigma ** 2) + torch.diag(invL)
+    b_vec = Aty / (noise_sigma ** 2)
+    x_map = torch.linalg.solve(Precision, b_vec)
+    Sigma_true = torch.inverse(Precision).cpu().numpy()
+
+    sig_norm = float(torch.norm(A @ x_true).detach().cpu().item())
+    noise_norm = float(torch.norm(noise).detach().cpu().item()) + 1e-30
+    snr_db = 20.0 * math.log10(max(sig_norm / noise_norm, 1e-30))
+
+    geom = {
+        "cr": float(np.clip(1.0 / cond_level, 0.0, 1.0)),
+        "cond": float(cond_level),
+        "snr_db": float(snr_db),
+    }
+
+    return {
+        "sqrtL": sqrtL,
+        "invL": invL,
+        "A": A,
+        "singular_vals": s.detach().cpu().numpy(),
+        "AtA": AtA,
+        "Aty": Aty,
+        "sigma": noise_sigma,
+        "x_true": x_true,
+        "x0": x_map,
+        "Sigma_true": Sigma_true,
+        "geom": geom,
+        "dim": dim,
+        "type": "linear",
+    }
+
+
+def build_cqnlse():
+    """Build the CQNLSE inverse problem (d=2)."""
+    from scipy.fftpack import fft, ifft
+
+    L_dom = 20
+    N_grid = 64
+    T_final = 0.5
+    nt = 100
+    sigma_obs = 0.02
+    alpha_true = 1.0
+    beta_true = 0.1
+
+    x_grid = np.linspace(-L_dom/2, L_dom/2, N_grid)
+    dx = x_grid[1] - x_grid[0]
+    k_vec = 2 * np.pi * np.fft.fftfreq(N_grid, dx)
+    lin_phase = np.exp(0.5 * 1j * k_vec**2 * (T_final / nt))
+
+    def solve_cqnlse_fwd(alpha, beta):
+        u = 1.5 / np.cosh(x_grid)
+        for _ in range(nt):
+            u = ifft(lin_phase * fft(u))
+            u2 = np.abs(u)**2
+            nonlin = np.exp(-1j * (alpha * u2 + beta * u2**2) * (T_final / nt))
+            u = u * nonlin
+            u = ifft(lin_phase * fft(u))
+        return x_grid, u
+
+    x_grid_out, u_true = solve_cqnlse_fwd(alpha_true, beta_true)
+    y_obs = u_true + sigma_obs * (np.random.randn(*u_true.shape) +
+                                    1j * np.random.randn(*u_true.shape))
+
+    prior_mean = np.array([0.8, 0.2])
+    prior_std = np.array([0.2, 0.1])
+    sqrtL_np = prior_std
+    sqrtL_torch = torch.tensor(prior_std, device=DEVICE, dtype=DTYPE)
+    invL = 1.0 / (sqrtL_np ** 2)
+
+    return {
+        "sqrtL": sqrtL_torch,
+        "invL": invL,
+        "x_true": torch.tensor([alpha_true, beta_true], device=DEVICE, dtype=DTYPE),
+        "x0": torch.tensor(prior_mean, device=DEVICE, dtype=DTYPE),
+        "dim": 2,
+        "type": "cqnlse",
+        "prior_mean": prior_mean,
+        "prior_std": prior_std,
+        "sigma_obs": sigma_obs,
+        "x_grid": x_grid_out,
+        "y_obs": y_obs,
+        "solve_cqnlse": solve_cqnlse_fwd,
+        "geom": {"cond": None, "snr_db": None},
+        "singular_vals": None,
+        "Sigma_true": None,
+    }
+
+
+def build_problem_for_exp(exp_name, dim):
+    """Build the appropriate problem for an experiment name and dimension."""
+    set_problem_seed(exp_name, dim)
+    configs = {
+        "BaselineScan":      (0.5, 20.0, 1.0),
+        "WellConditioned":   (0.5, 2.0, 1.0),
+        "IllConditioned":    (0.5, 200.0, 1.0),
+        "LowSNR":            (0.5, 20.0, 0.35),
+        "HighSNR":           (0.5, 20.0, 2.5),
+    }
+    if exp_name in configs:
+        sigma, kappa, snr = configs[exp_name]
+        return build_linear_gaussian(dim, sigma=sigma, cond_level=kappa, snr_level=snr)
+    elif exp_name == "CQNLSE":
+        return build_cqnlse()
+    else:
+        raise ValueError(f"Unknown experiment: {exp_name}")
+
+
+# === DATA LOADING FROM CHECKPOINTS ===
+# Reconstructs result entries from saved .npz checkpoints.
+
+
+def load_checkpoint(category: str, name: str):
+    """Load arrays from a checkpoint .npz file. Returns None if not found."""
+    path = os.path.join(CKPT_DIR, category, name + ".npz")
+    if not os.path.exists(path):
+        return None
+    return dict(np.load(path, allow_pickle=True))
+
+
+def load_manifest():
+    """Load the checkpoint manifest."""
+    path = os.path.join(CKPT_DIR, "manifest.json")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    logprint(f"WARNING: Manifest not found at {path}")
+    logprint("  Did you run generate_data_checkpoint.ipynb first?")
+    return {"completed": [], "cqnlse": [], "sensitivity": [], "multiseed": []}
+
+
+def load_config():
+    """Load the experiment configuration."""
+    path = os.path.join(OUTDIR, "config_used.json")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def load_lg_result(exp_name, dim, method):
+    """Load a single LG result from checkpoint and reconstruct full entry dict."""
+    name = f"{_safe_name(exp_name)}_d{dim}_{_safe_name(method)}"
+    data = load_checkpoint("lg", name)
+    if data is None:
+        return None
+
+    chains = [data["chains"][i] for i in range(data["chains"].shape[0])]
+    ars = list(data["ars"])
+    times = list(data["times"])
+    eval_counts = list(data["eval_counts"])
+    burn = int(data["burn"])
+
+    # Rebuild problem for summary computation
+    prob = build_problem_for_exp(exp_name, dim)
+    summary = summarize_multichain(
+        chains, burn,
+        prob["x_true"].cpu().numpy(),
+        prob.get("Sigma_true"),
+    )
+
+    ess_val = summary["ess_concat"]
+    ess_s = ess_val / max(np.mean(times), 1e-12)
+    ess_eval = ess_val / max(np.mean(eval_counts), 1e-12)
+
+    return {
+        "exp": exp_name,
+        "dim": dim,
+        "method": method,
+        "AR": float(np.mean(ars)),
+        "AR_std": float(np.std(ars)),
+        "ESS_concat": float(ess_val),
+        "ESS_minchain": float(summary["ess_minchain"]),
+        "ESS_s": float(ess_s),
+        "ESS_eval": float(ess_eval),
+        "Rhat": float(summary["rhat_max"]),
+        "Err_mu": float(summary["err_mu"]),
+        "Err_cov": float(summary["err_cov"]),
+        "Contract": float(summary["contract"]),
+        "Time": float(np.mean(times)),
+        "Time_std": float(np.std(times)),
+        "burn": burn,
+        "eval_mean": float(np.mean(eval_counts)),
+        "ci": summary["ci"],
+        "chains": chains,
+        "singular_vals": prob.get("singular_vals"),
+        "prior_std": prob["sqrtL"].detach().cpu().numpy()
+            if isinstance(prob["sqrtL"], torch.Tensor) else prob["sqrtL"],
+    }
+
+
+def load_all_lg_results():
+    """Load all linear-Gaussian results from checkpoints."""
+    manifest = load_manifest()
+    config = load_config()
+    baseline_dims = config.get("baseline_dims", list(range(10, 101, 10)))
+    fixed_dim = config.get("fixed_dim", 80)
+
+    exp_dims = {
+        "BaselineScan": baseline_dims,
+        "WellConditioned": [fixed_dim],
+        "IllConditioned": [fixed_dim],
+        "LowSNR": [fixed_dim],
+        "HighSNR": [fixed_dim],
+    }
+
+    results = []
+    for exp_name, dims in exp_dims.items():
+        for dim in dims:
+            for method in METHODS:
+                entry = load_lg_result(exp_name, dim, method)
+                if entry is not None:
+                    results.append(entry)
+
+    logprint(f"Loaded {len(results)} LG results from checkpoints.")
+    return results
+
+
+def load_cqnlse_results():
+    """Load all CQNLSE results from checkpoints."""
+    set_problem_seed("CQNLSE", 2)
+    prob = build_cqnlse()
+
+    dim_c = 2
+    N_c = EVAL_BUDGET_CQNLSE - 1
+    burn_c = int(N_c * DEFAULT_ADAPT["burn_frac_cqnlse"])
+
+    chains_all = {}
+    samples = []
+    rhat_dict = {}
+
+    for i, method in enumerate(METHODS):
+        ckpt_name = f"CQNLSE_d2_{_safe_name(method)}"
+        data = load_checkpoint("cqnlse", ckpt_name)
+        if data is None:
+            logprint(f"  WARNING: CQNLSE checkpoint not found for {method}")
+            continue
+
+        chains = [data["chains"][i] for i in range(data["chains"].shape[0])]
+        chains_all[method] = chains
+        samples.append(chains[0])
+
+        post_all = np.concatenate([ch[burn_c:] for ch in chains], axis=0)
+        rhat_val = split_rhat(np.stack([ch[burn_c:] for ch in chains], axis=0))
+        rhat_dict[method] = float(np.max(rhat_val))
+
+    logprint(f"Loaded {len(chains_all)} CQNLSE method results.")
+    return chains_all, samples, rhat_dict, prob, burn_c
+
+
+def load_sensitivity_results():
+    """Load all sensitivity analysis results from checkpoints."""
+    sens_results = {"target_ar": [], "adapt_interval": [], "burn_frac": []}
+
+    # target_ar
+    for tar in [0.10, 0.15, 0.234, 0.30, 0.40, 0.50]:
+        data = load_checkpoint("sensitivity", f"target_ar_{tar}")
+        if data is not None:
+            sens_results["target_ar"].append({
+                "target_ar": tar,
+                "ESS": float(data["ess"]),
+                "ESS_s": float(data["ess_s"]),
+                "Rhat": float(data["rhat"]),
+                "AR": float(data["ar"]),
+            })
+
+    # adapt_interval
+    for interv in [50, 100, 200, 400, 800]:
+        data = load_checkpoint("sensitivity", f"adapt_interval_{interv}")
+        if data is not None:
+            sens_results["adapt_interval"].append({
+                "adapt_interval": interv,
+                "ESS": float(data["ess"]),
+                "ESS_s": float(data["ess_s"]),
+                "Rhat": float(data["rhat"]),
+            })
+
+    # burn_frac
+    for bf in [0.05, 0.10, 0.15, 0.25, 0.30, 0.40, 0.50]:
+        data = load_checkpoint("sensitivity", f"burn_frac_{bf}")
+        if data is not None:
+            sens_results["burn_frac"].append({
+                "burn_frac": bf,
+                "ESS": float(data["ess"]),
+                "ESS_s": float(data["ess_s"]),
+                "Rhat": float(data["rhat"]),
+                "burn": int(data["burn"]),
+            })
+
+    logprint(f"Loaded sensitivity: target_ar={len(sens_results['target_ar'])}, "
+             f"adapt_interval={len(sens_results['adapt_interval'])}, "
+             f"burn_frac={len(sens_results['burn_frac'])}")
+    return sens_results
+
+
+def load_multiseed_results():
+    """Load all multi-seed UQ results from checkpoints."""
+    n_seeds = load_config().get("n_seeds_uncertainty", 5)
+    dim = load_config().get("fixed_dim", 80)
+    prob = build_problem_for_exp("IllConditioned", dim)
+
+    all_seed_data = {}
+    for method in METHODS:
+        all_seed_data[method] = []
+        for seed in range(n_seeds):
+            ckpt_name = f"{_safe_name(method)}_seed{seed}"
+            data = load_checkpoint("multiseed", ckpt_name)
+            if data is None:
+                continue
+            chains = [data["chains"][i] for i in range(data["chains"].shape[0])]
+            times = list(data["times"])
+            ars = list(data["ars"])
+            eval_counts = list(data["eval_counts"])
+            burn = int(data["burn"])
+
+            summary = summarize_multichain(
+                chains, burn,
+                prob["x_true"].cpu().numpy(),
+                prob.get("Sigma_true"),
+            )
+            ess_val = summary["ess_concat"]
+            all_seed_data[method].append({
+                "ess": ess_val,
+                "ess_s": ess_val / max(np.mean(times), 1e-12),
+                "ess_eval": ess_val / max(np.mean(eval_counts), 1e-12),
+                "rhat": summary["rhat_max"],
+                "ar": np.mean(ars),
+                "time": np.mean(times),
+                "err_mu": summary["err_mu"],
+            })
+
+    # Aggregate
+    unc_results = []
+    for method in METHODS:
+        data = all_seed_data[method]
+        if not data:
+            continue
+        unc_results.append({
+            "method": method,
+            "ESS_mean": np.mean([d["ess"] for d in data]),
+            "ESS_std": np.std([d["ess"] for d in data]),
+            "ESS_s_mean": np.mean([d["ess_s"] for d in data]),
+            "ESS_s_std": np.std([d["ess_s"] for d in data]),
+            "ESS_eval_mean": np.mean([d["ess_eval"] for d in data]),
+            "ESS_eval_std": np.std([d["ess_eval"] for d in data]),
+            "Rhat_mean": np.mean([d["rhat"] for d in data]),
+            "Rhat_std": np.std([d["rhat"] for d in data]),
+            "AR_mean": np.mean([d["ar"] for d in data]),
+            "AR_std": np.std([d["ar"] for d in data]),
+            "Time_mean": np.mean([d["time"] for d in data]),
+            "Time_std": np.std([d["time"] for d in data]),
+            "Err_mu_mean": np.mean([d["err_mu"] for d in data]),
+            "Err_mu_std": np.std([d["err_mu"] for d in data]),
+        })
+
+    logprint(f"Loaded multiseed results for {len(unc_results)} methods.")
+    return unc_results
+
+
+# === PLOTTING FUNCTIONS (Fig1–Fig8) ===
+
+
+def beautify_ax(ax, grid=True):
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.tick_params(direction="out", length=3, width=0.6)
+    if grid:
+        ax.grid(True)
+
+
+def add_panel_label(ax, label):
+    ax.text(-0.14, 1.10, f"({label})", transform=ax.transAxes,
+            fontsize=11, fontweight="bold", va="top", ha="right")
+
+
+# --- Fig 1: Problem setup ---
+def plot_fig1(problem, outfile_png, outfile_pdf):
+    svals = problem["singular_vals"]
+    prior_std = problem["prior_std"]
+    dim = problem["dim"]
+    if svals is None:
+        return
+
+    x = np.arange(1, dim + 1)
+    fig, axes = plt.subplots(1, 3, figsize=(10.2, 3.1))
+
+    axes[0].fill_between(x, svals, color="#BDC3C7", alpha=0.20)
+    axes[0].plot(x, svals, color="#2C3E50", lw=1.6)
+    axes[0].set_title("Forward Spectrum", fontweight="bold")
+    axes[0].set_xlabel("Index $i$")
+    axes[0].set_ylabel("Singular Value $\\sigma_i$")
+
+    axes[1].plot(x, prior_std, color="#2980B9", marker="o", markersize=2.5,
+                 mec="white", mew=0.5, lw=1.4, markevery=max(1, dim // 20))
+    axes[1].set_title("Prior Length Scales", fontweight="bold")
+    axes[1].set_xlabel("Index $i$")
+    axes[1].set_ylabel("$\\sqrt{L_{ii}}$")
+
+    axes[2].bar(x, 1.0 / (1.0 + svals**2), color="#E74C3C", alpha=0.65, width=0.85)
+    axes[2].set_title("Inference Difficulty", fontweight="bold")
+    axes[2].set_xlabel("Index $i$")
+    axes[2].set_ylabel("Contraction Proxy")
+
+    for i, ax in enumerate(axes):
+        beautify_ax(ax)
+        add_panel_label(ax, ["a", "b", "c"][i])
+
+    plt.savefig(outfile_png)
+    plt.savefig(outfile_pdf)
+    plt.close(fig)
+
+
+# --- Fig 2: Baseline scaling ---
+def plot_fig2_baseline(res0, outfile_png, outfile_pdf):
+    dims = sorted(list(set([r["dim"] for r in res0])))
+    fig, axes = plt.subplots(2, 2, figsize=(9.2, 7.0))
+    axes = axes.flatten()
+
+    metrics = ["ESS_s", "ESS_eval", "Rhat", "AR"]
+    ylabels = ["ESS / sec", "ESS / eval", "Split-$\\hat{R}$", "Acceptance Rate"]
+    titles = ["Absolute Efficiency", "Algorithmic Efficiency", "Convergence Rate", "Acceptance Behavior"]
+
+    for i, (m, yl, tl) in enumerate(zip(metrics, ylabels, titles)):
+        ax = axes[i]
+        for method in METHODS:
+            rr = sorted([r for r in res0 if r["method"] == method], key=lambda x: x["dim"])
+            ax.plot(
+                [x["dim"] for x in rr], [x[m] for x in rr],
+                marker=MARKERS[method], markersize=6, mec="white", mew=0.8,
+                linestyle=LINESTYLES[method], color=METHOD_COLORS[method],
+                label=method,
+            )
+        ax.set_title(tl, fontweight="bold")
+        ax.set_xlabel("Dimension $d$")
+        ax.set_ylabel(yl)
+        beautify_ax(ax)
+        add_panel_label(ax, ["a", "b", "c", "d"][i])
+        if m == "Rhat":
+            ax.axhline(1.1, color="black", ls=":", alpha=0.35)
+        if m == "AR":
+            ax.axhline(0.234, color="black", ls="--", alpha=0.20)
+        ax.set_xticks(dims)
+
+    axes[0].legend(frameon=False, loc="upper right", ncol=2)
+    plt.savefig(outfile_png)
+    plt.savefig(outfile_pdf)
+    plt.close(fig)
+
+
+# --- Fig 3: Regime comparison ---
+def plot_fig3_regime(all_results, outfile_png, outfile_pdf, fixed_dim=80):
+    regimes = ["WellConditioned", "IllConditioned", "LowSNR", "HighSNR"]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10.2, 4.1))
+    width = 0.15
+    xbase = np.arange(len(regimes))
+
+    for mi, method in enumerate(METHODS):
+        vals_s, vals_ev = [], []
+        for reg in regimes:
+            matches = [r for r in all_results
+                       if r["exp"] == reg and r["method"] == method and r["dim"] == fixed_dim]
+            if matches:
+                vals_s.append(matches[0]["ESS_s"])
+                vals_ev.append(matches[0]["ESS_eval"])
+            else:
+                vals_s.append(0)
+                vals_ev.append(0)
+
+        ax1.bar(xbase + (mi - 2) * width, vals_s, width=width,
+                color=METHOD_COLORS[method], alpha=0.85, edgecolor="white",
+                linewidth=0.5, label=method)
+        ax2.bar(xbase + (mi - 2) * width, vals_ev, width=width,
+                color=METHOD_COLORS[method], alpha=0.85, edgecolor="white",
+                linewidth=0.5, label=method)
+
+    ax1.set_title("Sampling Speed", fontweight="bold")
+    ax2.set_title("Evaluation Economy", fontweight="bold")
+    ax1.set_ylabel("ESS / sec")
+    ax2.set_ylabel("ESS / eval")
+    ax1.set_xticks(xbase)
+    ax2.set_xticks(xbase)
+    ax1.set_xticklabels(regimes, rotation=15)
+    ax2.set_xticklabels(regimes, rotation=15)
+    beautify_ax(ax1)
+    beautify_ax(ax2)
+    add_panel_label(ax1, "a")
+    add_panel_label(ax2, "b")
+    ax2.legend(frameon=False, bbox_to_anchor=(1.02, 1.0), loc="upper left", ncol=1)
+    plt.savefig(outfile_png)
+    plt.savefig(outfile_pdf)
+    plt.close(fig)
+
+
+# --- Fig 4: Trace + ACF (ill-conditioned) ---
+def plot_fig4_trace_acf(res_ill, outfile_png, outfile_pdf):
+    fig, axes = plt.subplots(2, 2, figsize=(9.2, 6.4))
+    axes = axes.flatten()
+    max_trace_len = 2500
+    max_acf_lag = 150
+
+    for method in METHODS:
+        entry = next((r for r in res_ill if r["method"] == method), None)
+        if entry is None:
+            continue
+        chain = entry["chains"][0]
+        burn = entry["burn"]
+        color = METHOD_COLORS[method]
+
+        trace0 = chain[:max_trace_len, 0]
+        ac0 = autocorr(chain[burn:, 0], max_lag=max_acf_lag)
+
+        axes[0].plot(trace0, color=color, alpha=0.65, lw=0.6, label=method)
+        axes[1].plot(ac0[:max_acf_lag], color=color, lw=1.4)
+
+        if chain.shape[1] > 1:
+            trace1 = chain[:max_trace_len, 1]
+            ac1 = autocorr(chain[burn:, 1], max_lag=max_acf_lag)
+            axes[2].plot(trace1, color=color, alpha=0.65, lw=0.6)
+            axes[3].plot(ac1[:max_acf_lag], color=color, lw=1.4)
+
+    titles = ["Trace plot $x_1$", "ACF $x_1$", "Trace plot $x_2$", "ACF $x_2$"]
+    for i, ax in enumerate(axes):
+        ax.set_title(titles[i], fontweight="bold", loc="left")
+        beautify_ax(ax)
+        add_panel_label(ax, ["a", "b", "c", "d"][i])
+        if i in [1, 3]:
+            ax.axhline(0.0, color="black", lw=1.0, alpha=0.25)
+
+    axes[0].legend(frameon=False, ncol=3, loc="upper right", fontsize=6)
+    plt.savefig(outfile_png)
+    plt.savefig(outfile_pdf)
+    plt.close(fig)
+
+
+# --- Fig 5: Posterior marginals ---
+def plot_fig5_marginals(entry, outfile_png, outfile_pdf):
+    import scipy.stats as st
+    burn = entry["burn"]
+    post = np.concatenate([c[burn:] for c in entry["chains"]], axis=0)
+    x0 = post[:, 0]
+    x1 = post[:, 1]
+    color = METHOD_COLORS[entry["method"]]
+
+    fig = plt.figure(figsize=(7.2, 6.2))
+    gs = fig.add_gridspec(2, 2, width_ratios=(4, 1.2), height_ratios=(1.2, 4),
+                          wspace=0.05, hspace=0.05)
+    ax_main = fig.add_subplot(gs[1, 0])
+    ax_hx = fig.add_subplot(gs[0, 0], sharex=ax_main)
+    ax_hy = fig.add_subplot(gs[1, 1], sharey=ax_main)
+
+    ax_main.hexbin(x0, x1, gridsize=40, cmap="Greys", mincnt=1, alpha=0.20)
+    rng = np.random.default_rng(12345)
+    idx = rng.choice(len(x0), size=min(len(x0), 3500), replace=False)
+    ax_main.scatter(x0[idx], x1[idx], s=1.2, color=color, alpha=0.25)
+
+    kde_x = st.gaussian_kde(x0)
+    kde_y = st.gaussian_kde(x1)
+    xx = np.linspace(x0.min(), x0.max(), 200)
+    yy = np.linspace(x1.min(), x1.max(), 200)
+    ax_hx.fill_between(xx, kde_x(xx), color=color, alpha=0.30)
+    ax_hx.plot(xx, kde_x(xx), color=color, lw=1.2)
+    ax_hy.fill_betweenx(yy, kde_y(yy), color=color, alpha=0.30)
+    ax_hy.plot(kde_y(yy), yy, color=color, lw=1.2)
+    ax_hx.axis("off")
+    ax_hy.axis("off")
+    ax_main.set_xlabel("Parameter $x_1$")
+    ax_main.set_ylabel("Parameter $x_2$")
+    beautify_ax(ax_main)
+    ax_main.set_title(f"Posterior: {entry['method']}", fontweight="bold", pad=8)
+
+    plt.savefig(outfile_png)
+    plt.savefig(outfile_pdf)
+    plt.close(fig)
+
+
+# --- Fig 6: CQNLSE diagnostics (2x3) ---
+def plot_fig6_cqnlse_diag(samples_list, problem, outfile_png, outfile_pdf):
+    from scipy.stats import gaussian_kde
+    burn = 1500
+
+    traces_alpha = [s[burn:, 0] for s in samples_list]
+    traces_beta = [s[burn:, 1] for s in samples_list]
+
+    def compute_acf(series, max_lag=40):
+        n = len(series)
+        s = series - series.mean()
+        n_fft = 1
+        while n_fft < 2 * n:
+            n_fft *= 2
+        fft_s = np.fft.rfft(s, n=n_fft)
+        acf_full = np.fft.irfft(fft_s * np.conj(fft_s))[:n]
+        return acf_full[:max_lag+1] / (acf_full[0] + 1e-12)
+
+    acfs_alpha = [compute_acf(tr) for tr in traces_alpha]
+    acfs_beta = [compute_acf(tr) for tr in traces_beta]
+
+    fig, axes = plt.subplots(2, 3, figsize=(13, 8))
+    for col in range(2):
+        ax = axes[0, col]
+        tr_list = traces_alpha if col == 0 else traces_beta
+        for i, name in enumerate(METHODS):
+            if i >= len(tr_list):
+                break
+            c = METHOD_COLORS[name]
+            m = MARKERS[name]
+            ls = LINESTYLES[name]
+            ax.plot(tr_list[i], color=c, marker=m,
+                    markevery=max(1, len(tr_list[i])//60),
+                    markersize=3, linestyle=ls, linewidth=1.0,
+                    label=name if col == 0 else "", alpha=0.85)
+        true_val = 1.0 if col == 0 else 0.1
+        ax.axhline(true_val, color='k', linestyle=':', linewidth=1.2, alpha=0.6,
+                   label='True' if col == 0 else "")
+        ax.set_ylabel(r'$\alpha$' if col == 0 else r'$\beta$')
+        ax.set_xlabel('Iteration')
+        if col == 0:
+            ax.legend(frameon=False, fontsize=6, loc='upper left', ncol=2)
+        beautify_ax(ax)
+        add_panel_label(ax, chr(97 + col))
+
+    ax = axes[0, 2]
+    for i, name in enumerate(METHODS):
+        if i >= len(acfs_alpha):
+            break
+        ax.plot(range(len(acfs_alpha[i])), acfs_alpha[i],
+                color=METHOD_COLORS[name], marker=MARKERS[name], markersize=4,
+                linestyle=LINESTYLES[name], linewidth=1.2, label=name)
+    ax.axhline(0.05, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
+    ax.set_ylabel(r'ACF ($\alpha$)')
+    ax.set_xlabel('Lag')
+    ax.legend(frameon=False, fontsize=6, loc='upper right')
+    beautify_ax(ax)
+    add_panel_label(ax, 'c')
+
+    ax = axes[1, 0]
+    for i, name in enumerate(METHODS):
+        if i >= len(acfs_beta):
+            break
+        ax.plot(range(len(acfs_beta[i])), acfs_beta[i],
+                color=METHOD_COLORS[name], marker=MARKERS[name], markersize=4,
+                linestyle=LINESTYLES[name], linewidth=1.2, label=name)
+    ax.axhline(0.05, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
+    ax.set_ylabel(r'ACF ($\beta$)')
+    ax.set_xlabel('Lag')
+    beautify_ax(ax)
+    add_panel_label(ax, 'd')
+
+    for col in range(2):
+        ax = axes[1, col + 1]
+        tr_list = traces_alpha if col == 0 else traces_beta
+        x_min = min(tr.min() for tr in tr_list)
+        x_max = max(tr.max() for tr in tr_list)
+        pad = 0.12 * (x_max - x_min)
+        x_kde = np.linspace(x_min - pad, x_max + pad, 400)
+        for i, name in enumerate(METHODS):
+            if i >= len(tr_list):
+                break
+            kde = gaussian_kde(tr_list[i], bw_method='scott')
+            ax.plot(x_kde, kde(x_kde), color=METHOD_COLORS[name],
+                    linestyle=LINESTYLES[name], linewidth=1.6,
+                    label=name if col == 0 else "")
+        true_val = 1.0 if col == 0 else 0.1
+        ax.axvline(true_val, color='k', linestyle=':', linewidth=1.2, alpha=0.6,
+                   label='True' if col == 0 else "")
+        ax.set_xlabel(r'$\alpha$' if col == 0 else r'$\beta$')
+        ax.set_ylabel('Density')
+        if col == 0:
+            ax.legend(frameon=False, fontsize=6, loc='upper left')
+        beautify_ax(ax)
+        add_panel_label(ax, chr(97 + col + 4))
+
+    plt.savefig(outfile_png)
+    plt.savefig(outfile_pdf)
+    plt.close(fig)
+
+
+# --- Fig 7: CQNLSE uncertainty ---
+def plot_fig7_cqnlse_uq(samples_list, rhat_dict, problem, outfile_png, outfile_pdf):
+    burn = 1500
+    x_grid = problem["x_grid"]
+    y_obs = problem["y_obs"]
+    solve_cqnlse = problem["solve_cqnlse"]
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+
+    # (a) Credible intervals
+    ax = axes[0, 0]
+    x_pos = np.array([1, 2])
+    width = 0.15
+    for i, name in enumerate(METHODS):
+        if i >= len(samples_list):
+            break
+        post = samples_list[i][burn:]
+        ci = credible_interval(post, ci=0.95)
+        mu_a = post[:, 0].mean()
+        mu_b = post[:, 1].mean() * 10
+        ci_a = ci[0]
+        ci_b = ci[1] * 10
+        offset = (i - 2) * width
+        # Clamp yerr to avoid negative values from skewed posteriors
+        yerr_a = [max(0, mu_a - ci_a[0]), max(0, ci_a[1] - mu_a)]
+        yerr_b = [max(0, mu_b - ci_b[0]), max(0, ci_b[1] - mu_b)]
+        ax.errorbar(x_pos[0] + offset, mu_a,
+                    yerr=[[yerr_a[0]], [yerr_a[1]]],
+                    fmt=MARKERS[name], color=METHOD_COLORS[name], capsize=4,
+                    linewidth=1.2, linestyle='none')
+        ax.errorbar(x_pos[1] + offset, mu_b,
+                    yerr=[[yerr_b[0]], [yerr_b[1]]],
+                    fmt=MARKERS[name], color=METHOD_COLORS[name], capsize=4,
+                    linewidth=1.2, linestyle='none')
+    ax.axhline(1.0, color='k', linestyle='--', linewidth=1, alpha=0.6, label='True alpha')
+    ax.axhline(1.0, color='k', linestyle=':', linewidth=1, alpha=0.6, label='True beta x10')
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(['alpha', 'beta (x10)'])
+    ax.set_ylabel('Posterior Mean +/- 95% CI')
+    ax.legend(frameon=False, fontsize=6, loc='upper left')
+    beautify_ax(ax)
+    add_panel_label(ax, 'a')
+
+    # (b) Posterior predictive check
+    ax = axes[0, 1]
+    for i, name in enumerate(METHODS):
+        if i >= len(samples_list):
+            break
+        post = samples_list[i][burn:]
+        n_ppc = min(100, len(post))
+        indices = np.random.choice(len(post), n_ppc, replace=False)
+        predictions = []
+        for idx in indices:
+            _, u_pred = solve_cqnlse(post[idx, 0], post[idx, 1])
+            predictions.append(u_pred.real)
+        predictions = np.array(predictions)
+        ppc_mean = np.mean(predictions, axis=0)
+        ppc_lower = np.percentile(predictions, 2.5, axis=0)
+        ppc_upper = np.percentile(predictions, 97.5, axis=0)
+        ax.fill_between(x_grid, ppc_lower, ppc_upper, alpha=0.15,
+                        color=METHOD_COLORS[name])
+        ax.plot(x_grid, ppc_mean, color=METHOD_COLORS[name], linewidth=1.2,
+                linestyle=LINESTYLES[name], label=name)
+    ax.plot(x_grid, y_obs.real, color='k', linewidth=1.0, linestyle='--',
+            label='Observation')
+    ax.set_xlabel('Spatial grid')
+    ax.set_ylabel('Wave amplitude')
+    ax.set_title('Posterior Predictive Check')
+    ax.legend(frameon=False, fontsize=6, loc='upper left')
+    beautify_ax(ax)
+    add_panel_label(ax, 'b')
+
+    # (c) Rhat bar chart
+    ax = axes[1, 0]
+    rhat_vals = []
+    for name in METHODS:
+        if name in rhat_dict:
+            rhat_vals.append(rhat_dict[name])
+        else:
+            rhat_vals.append(np.nan)
+    x_bar = np.arange(len(METHODS))
+    colors_bar = [METHOD_COLORS[m] for m in METHODS]
+    ax.bar(x_bar, rhat_vals, width=0.5, color=colors_bar, edgecolor='k', linewidth=0.8)
+    ax.axhline(1.05, color='r', linestyle='--', linewidth=1.2, alpha=0.8,
+               label='Rhat=1.05 threshold')
+    ax.set_xticks(x_bar)
+    ax.set_xticklabels([m.replace("Acceptance-Rate Adaptive pCN", "AR-Adaptive pCN")
+                        for m in METHODS], rotation=25, ha='right', fontsize=7)
+    ax.set_ylabel('Split-Rhat (max)')
+    ax.legend(frameon=False, fontsize=7, loc='upper left')
+    beautify_ax(ax)
+    add_panel_label(ax, 'c')
+
+    # (d) ESS bar chart
+    ax = axes[1, 1]
+    ess_vals = []
+    for i, name in enumerate(METHODS):
+        if i >= len(samples_list):
+            break
+        post = samples_list[i][burn:]
+        ess_vals.append(ess_mean(post))
+    x_bar = np.arange(len(ess_vals))
+    ax.bar(x_bar, ess_vals, width=0.5, color=colors_bar[:len(ess_vals)],
+           edgecolor='k', linewidth=0.8)
+    ax.set_xticks(x_bar)
+    ax.set_xticklabels([m.replace("Acceptance-Rate Adaptive pCN", "AR-Adaptive pCN")
+                        for m in METHODS[:len(ess_vals)]], rotation=25, ha='right', fontsize=7)
+    ax.set_ylabel('ESS (mean)')
+    beautify_ax(ax)
+    add_panel_label(ax, 'd')
+
+    plt.savefig(outfile_png)
+    plt.savefig(outfile_pdf)
+    plt.close(fig)
+
+
+# --- Fig 8: Sensitivity analysis plots ---
+def plot_fig8_sensitivity(sens_results, outfile_png, outfile_pdf):
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
+
+    # (a) Target acceptance rate
+    ax = axes[0]
+    tar_data = sens_results["target_ar"]
+    tar_vals = [d["target_ar"] for d in tar_data]
+    ess_vals = [d["ESS"] for d in tar_data]
+    ax.plot(tar_vals, ess_vals, "o-", color=METHOD_COLORS["Acceptance-Rate Adaptive pCN"],
+            linewidth=1.5, markersize=6)
+    ax.axvline(0.234, color="gray", linestyle="--", alpha=0.5, label="Default (0.234)")
+    ax.set_xlabel("Target Acceptance Rate $\\alpha^*$")
+    ax.set_ylabel("ESS (concat)")
+    ax.set_title("Sensitivity to $\\alpha^*$", fontweight="bold")
+    ax.legend(frameon=False, fontsize=7)
+    beautify_ax(ax)
+    add_panel_label(ax, "a")
+
+    # (b) Adaptation interval
+    ax = axes[1]
+    int_data = sens_results["adapt_interval"]
+    int_vals = [d["adapt_interval"] for d in int_data]
+    ess_vals = [d["ESS"] for d in int_data]
+    ax.plot(int_vals, ess_vals, "s-", color=METHOD_COLORS["Dual-Signal pCN"],
+            linewidth=1.5, markersize=6)
+    ax.axvline(200, color="gray", linestyle="--", alpha=0.5, label="Default (200)")
+    ax.set_xlabel("Adaptation Interval $K$")
+    ax.set_ylabel("ESS (concat)")
+    ax.set_title("Sensitivity to $K$", fontweight="bold")
+    ax.legend(frameon=False, fontsize=7)
+    beautify_ax(ax)
+    add_panel_label(ax, "b")
+
+    # (c) Burn-in fraction
+    ax = axes[2]
+    bf_data = sens_results["burn_frac"]
+    bf_vals = [d["burn_frac"] for d in bf_data]
+    ess_vals = [d["ESS"] for d in bf_data]
+    ax.plot(bf_vals, ess_vals, "^-", color=METHOD_COLORS["Adaptive Metropolis"],
+            linewidth=1.5, markersize=6)
+    ax.axvline(0.30, color="gray", linestyle="--", alpha=0.5, label="Default (0.30)")
+    ax.set_xlabel("Burn-in Fraction")
+    ax.set_ylabel("ESS (concat)")
+    ax.set_title("Sensitivity to Burn-in", fontweight="bold")
+    ax.legend(frameon=False, fontsize=7)
+    beautify_ax(ax)
+    add_panel_label(ax, "c")
+
+    plt.savefig(outfile_png)
+    plt.savefig(outfile_pdf)
+    plt.close(fig)
+
+
+# === TABLE OUTPUT FUNCTIONS ===
+
+
+def make_table(results_subset, title, outfile):
+    """Generate a formatted table from results and save to file."""
+    rows = []
+    for r in results_subset:
+        ci_txt = ""
+        if len(r.get("ci", [])) >= 2:
+            ci_txt = (
+                f"x0={r['ci'][0][1]:.3f}[{r['ci'][0][0]:.3f},{r['ci'][0][2]:.3f}] | "
+                f"x1={r['ci'][1][1]:.3f}[{r['ci'][1][0]:.3f},{r['ci'][1][2]:.3f}]"
+            )
+        rows.append([
+            r["exp"], r["dim"], r["method"],
+            f"{r['AR']:.3f}",
+            f"{r['ESS_concat']:.1f}",
+            f"{r['ESS_minchain']:.1f}",
+            f"{r['ESS_s']:.3f}",
+            f"{r['ESS_eval']:.6f}",
+            f"{r['Rhat']:.3f}",
+            f"{r['Err_mu']:.3f}",
+            f"{r['Err_cov']:.3f}",
+            f"{r['Contract']:.3f}",
+            f"{r['Time']:.2f}",
+            ci_txt,
+        ])
+
+    headers = ["Exp", "Dim", "Method", "AR",
+               "ESS(concat)", "ESS(minchain)", "ESS/s", "ESS/eval",
+               "Rhat", "Err_mu", "Err_cov", "Contract", "Time", "CI(95%)"]
+    table_txt = tabulate(rows, headers=headers, tablefmt="grid")
+
+    logprint("\n" + "=" * 120)
+    logprint(title)
+    logprint("=" * 120)
+    logprint(table_txt)
+
+    with open(outfile, "w", encoding="utf-8") as f:
+        f.write(table_txt)
+
+
+def make_sensitivity_table(sens_results, outfile):
+    """Generate sensitivity analysis table."""
+    rows = []
+    for d in sens_results["target_ar"]:
+        rows.append(["target_ar", f"{d['target_ar']:.3f}",
+                     f"{d['ESS']:.1f}", f"{d['ESS_s']:.3f}", f"{d['Rhat']:.3f}"])
+    for d in sens_results["adapt_interval"]:
+        rows.append(["adapt_interval", f"{d['adapt_interval']}",
+                     f"{d['ESS']:.1f}", f"{d['ESS_s']:.3f}", f"{d['Rhat']:.3f}"])
+    for d in sens_results["burn_frac"]:
+        rows.append(["burn_frac", f"{d['burn_frac']:.2f}",
+                     f"{d['ESS']:.1f}", f"{d['ESS_s']:.3f}", f"{d['Rhat']:.3f}"])
+
+    headers = ["Parameter", "Value", "ESS", "ESS/s", "Rhat"]
+    table_txt = tabulate(rows, headers=headers, tablefmt="grid")
+    logprint("\n" + "=" * 80)
+    logprint("Sensitivity Analysis Table")
+    logprint("=" * 80)
+    logprint(table_txt)
+    with open(outfile, "w", encoding="utf-8") as f:
+        f.write(table_txt)
+
+
+def make_uncertainty_table(unc_results, outfile):
+    """Generate multi-seed uncertainty quantification table."""
+    rows = []
+    for r in unc_results:
+        rows.append([
+            r["method"],
+            f"{r['ESS_mean']:.1f} +/- {r['ESS_std']:.1f}",
+            f"{r['ESS_s_mean']:.3f} +/- {r['ESS_s_std']:.3f}",
+            f"{r['ESS_eval_mean']:.6f} +/- {r['ESS_eval_std']:.6f}",
+            f"{r['Rhat_mean']:.3f} +/- {r['Rhat_std']:.3f}",
+            f"{r['AR_mean']:.3f} +/- {r['AR_std']:.3f}",
+            f"{r['Err_mu_mean']:.3f} +/- {r['Err_mu_std']:.3f}",
+        ])
+    headers = ["Method", "ESS", "ESS/s", "ESS/eval", "Rhat", "AR", "Err_mu"]
+    table_txt = tabulate(rows, headers=headers, tablefmt="grid")
+    logprint("\n" + "=" * 100)
+    logprint("Multi-Seed Uncertainty Quantification (mean +/- std)")
+    logprint("=" * 100)
+    logprint(table_txt)
+    with open(outfile, "w", encoding="utf-8") as f:
+        f.write(table_txt)
+
+
+def make_cqnlse_table(cqnlse_chains_all, rhat_dict, burn_c, outfile):
+    """Generate CQNLSE results table."""
+    rows = []
+    for method in METHODS:
+        if method not in cqnlse_chains_all:
+            continue
+        chains = cqnlse_chains_all[method]
+        post_all = np.concatenate([ch[burn_c:] for ch in chains], axis=0)
+        ess_val = ess_mean(post_all)
+        a_est = post_all[:, 0].mean()
+        b_est = post_all[:, 1].mean()
+        ci = credible_interval(post_all, ci=0.95)
+        rows.append([
+            method,
+            f"{rhat_dict.get(method, 0):.3f}",
+            f"{ess_val:.1f}",
+            f"{a_est:.4f}",
+            f"{abs(a_est - 1.0):.4f}",
+            f"{b_est:.4f}",
+            f"{abs(b_est - 0.1):.4f}",
+            f"[{ci[0,0]:.3f},{ci[0,1]:.3f}]",
+            f"[{ci[1,0]:.3f},{ci[1,1]:.3f}]",
+        ])
+    table_txt = tabulate(
+        rows,
+        headers=["Method", "Rhat", "ESS", "alpha_est", "|alpha_err|",
+                 "beta_est", "|beta_err|", "CI(alpha)", "CI(beta)"],
+        tablefmt="grid"
+    )
+    logprint("\n" + "=" * 100)
+    logprint("CQNLSE Results Table")
+    logprint("=" * 100)
+    logprint(table_txt)
+    with open(outfile, "w", encoding="utf-8") as f:
+        f.write(table_txt)
+
+
+# === MAIN EXECUTION: Load data and generate all figures/tables ===
+
+config = load_config()
+fixed_dim = config.get("fixed_dim", 80)
+baseline_dims = config.get("baseline_dims", list(range(10, 101, 10)))
+
+logprint("\n" + "#" * 92)
+logprint("# LOADING ALL DATA FROM CHECKPOINTS")
+logprint("#" * 92)
+
+# --- Load all linear-Gaussian results ---
+all_lg_results = load_all_lg_results()
+res0 = [r for r in all_lg_results if r["exp"] == "BaselineScan"]
+
+# --- Load CQNLSE results ---
+cqnlse_chains_all, cqnlse_samples, cqnlse_rhat, prob_cqnlse, burn_c = \
+    load_cqnlse_results()
+
+# --- Load sensitivity results ---
+sens_results = load_sensitivity_results()
+
+# --- Load multiseed results ---
+unc_results = load_multiseed_results()
+
+logprint("\n  [OK] All data loaded.")
+
+# =============================================================================
+# GENERATE FIGURES
+# =============================================================================
+logprint("\n" + "#" * 92)
+logprint("# GENERATING FIGURES")
+logprint("#" * 92)
+
+# Fig 1: Problem setup
+fig1_entry = next((r for r in res0 if r["dim"] == fixed_dim and r["method"] == "Vanilla pCN"), None)
+if fig1_entry:
+    plot_fig1(fig1_entry,
+              os.path.join(OUTDIR, "Fig1_problem_setup.png"),
+              os.path.join(OUTDIR, "Fig1_problem_setup.pdf"))
+    logprint("  [OK] Fig1: Problem setup")
+
+# Fig 2: Baseline scaling
+if res0:
+    plot_fig2_baseline(res0,
+                       os.path.join(OUTDIR, "Fig2_baseline_scaling.png"),
+                       os.path.join(OUTDIR, "Fig2_baseline_scaling.pdf"))
+    logprint("  [OK] Fig2: Baseline scaling")
+
+# Fig 3: Regime comparison
+plot_fig3_regime(all_lg_results,
+                 os.path.join(OUTDIR, "Fig3_regime_barplot.png"),
+                 os.path.join(OUTDIR, "Fig3_regime_barplot.pdf"),
+                 fixed_dim=fixed_dim)
+logprint("  [OK] Fig3: Regime comparison")
+
+# Fig 4: Trace + ACF (ill-conditioned)
+res_ill = [r for r in all_lg_results if r["exp"] == "IllConditioned" and r["dim"] == fixed_dim]
+if res_ill:
+    plot_fig4_trace_acf(res_ill,
+                        os.path.join(OUTDIR, "Fig4_trace_acf_illconditioned.png"),
+                        os.path.join(OUTDIR, "Fig4_trace_acf_illconditioned.pdf"))
+    logprint("  [OK] Fig4: Trace + ACF")
+
+# Fig 5: Posterior marginals (best method in ill-conditioned)
+if res_ill:
+    best_ill = max(res_ill, key=lambda x: x["ESS_eval"])
+    plot_fig5_marginals(best_ill,
+                        os.path.join(OUTDIR, "Fig5_posterior_marginals.png"),
+                        os.path.join(OUTDIR, "Fig5_posterior_marginals.pdf"))
+    logprint("  [OK] Fig5: Posterior marginals")
+
+# Fig 6: CQNLSE diagnostics
+if cqnlse_samples:
+    plot_fig6_cqnlse_diag(cqnlse_samples, prob_cqnlse,
+                          os.path.join(OUTDIR, "Fig6_cqnlse_diagnostics.png"),
+                          os.path.join(OUTDIR, "Fig6_cqnlse_diagnostics.pdf"))
+    logprint("  [OK] Fig6: CQNLSE diagnostics")
+
+# Fig 7: CQNLSE uncertainty
+if cqnlse_samples:
+    plot_fig7_cqnlse_uq(cqnlse_samples, cqnlse_rhat, prob_cqnlse,
+                        os.path.join(OUTDIR, "Fig7_cqnlse_uncertainty.png"),
+                        os.path.join(OUTDIR, "Fig7_cqnlse_uncertainty.pdf"))
+    logprint("  [OK] Fig7: CQNLSE uncertainty")
+
+# Fig 8: Sensitivity analysis
+if sens_results["target_ar"]:
+    plot_fig8_sensitivity(sens_results,
+                          os.path.join(OUTDIR, "Fig8_sensitivity.png"),
+                          os.path.join(OUTDIR, "Fig8_sensitivity.pdf"))
+    logprint("  [OK] Fig8: Sensitivity analysis")
+
+# =============================================================================
+# GENERATE TABLES
+# =============================================================================
+logprint("\n" + "#" * 92)
+logprint("# GENERATING TABLES")
+logprint("#" * 92)
+
+# Main LG table
+if all_lg_results:
+    make_table(all_lg_results, "MAIN TABLE (ALL LINEAR-GAUSSIAN)",
+               os.path.join(OUTDIR, "Table_Main_LG.txt"))
+
+# Per-experiment tables
+for exp_name in ["BaselineScan", "WellConditioned", "IllConditioned", "LowSNR", "HighSNR"]:
+    subset = [r for r in all_lg_results if r["exp"] == exp_name]
+    if subset:
+        make_table(subset, f"TABLE: {exp_name}",
+                   os.path.join(OUTDIR, f"Table_{exp_name}.txt"))
+
+# CQNLSE table
+if cqnlse_chains_all:
+    make_cqnlse_table(cqnlse_chains_all, cqnlse_rhat, burn_c,
+                      os.path.join(OUTDIR, "Table_CQNLSE.txt"))
+
+# Sensitivity table
+if sens_results["target_ar"]:
+    make_sensitivity_table(sens_results,
+                           os.path.join(OUTDIR, "Table_Sensitivity.txt"))
+
+# Uncertainty table
+if unc_results:
+    make_uncertainty_table(unc_results,
+                           os.path.join(OUTDIR, "Table_Uncertainty.txt"))
+
+# =============================================================================
+# DONE
+# =============================================================================
+logprint("\n" + "=" * 90)
+logprint("ANALYSIS COMPLETE")
+logprint("=" * 90)
+logprint(f"\nOutput folder: {OUTDIR}/")
+logprint("  Figures: Fig1-Fig8 (PNG+PDF)")
+logprint("  Tables:  Table_Main_LG, Table_*, Table_CQNLSE, Table_Sensitivity, Table_Uncertainty")
+logprint(f"  Log:     analysis_log.txt")
